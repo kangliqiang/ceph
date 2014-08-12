@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <errno.h>
 
 #include <string>
@@ -74,9 +77,10 @@ int rgw_read_user_buckets(RGWRados *store, string user_id, RGWUserBuckets& bucke
 
   if (need_stats) {
     map<string, RGWBucketEnt>& m = buckets.get_buckets();
-    int r = store->update_containers_stats(m);
-    if (r < 0) {
+    ret = store->update_containers_stats(m);
+    if (ret < 0 && ret != -ENOENT) {
       ldout(store->ctx(), 0) << "ERROR: could not get stats for buckets" << dendl;
+      return ret;
     }
   }
   return 0;
@@ -368,7 +372,7 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
 
   if (delete_children) {
     int max = 1000;
-    ret = store->list_objects(bucket, max, prefix, delim, marker,
+    ret = store->list_objects(bucket, max, prefix, delim, marker, NULL,
             objs, common_prefixes,
             false, ns, true, NULL, NULL);
 
@@ -384,7 +388,7 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
       }
       objs.clear();
 
-      ret = store->list_objects(bucket, max, prefix, delim, marker, objs, common_prefixes,
+      ret = store->list_objects(bucket, max, prefix, delim, marker, NULL, objs, common_prefixes,
                                 false, ns, true, NULL, NULL);
       if (ret < 0)
         return ret;
@@ -461,6 +465,12 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
     return -EINVAL;
   }
 
+  string bucket_id = op_state.get_bucket_id();
+  if (bucket_id.empty()) {
+    set_err_msg(err_msg, "empty bucket instance id");
+    return -EINVAL;
+  }
+
   std::string no_oid;
 
   std::string display_name = op_state.get_user_display_name();
@@ -472,7 +482,8 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
   map<string, bufferlist> attrs;
   RGWBucketInfo bucket_info;
 
-  int r = store->get_bucket_info(NULL, bucket.name, bucket_info, NULL, &attrs);
+  string key = bucket.name + ":" + bucket_id;
+  int r = store->get_bucket_instance_info(NULL, key, bucket_info, NULL, &attrs);
   if (r < 0) {
     return r;
   }
@@ -630,7 +641,7 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
 
   do {
     vector<RGWObjEnt> result;
-    int r = store->list_objects(bucket, max, prefix, delim, marker,
+    int r = store->list_objects(bucket, max, prefix, delim, marker, NULL,
                                 result, common_prefixes, false,
                                 ns, true,
                                 &is_truncated, NULL);
@@ -857,7 +868,7 @@ int RGWBucketAdminOp::unlink(RGWRados *store, RGWBucketAdminOpState& op_state)
   return bucket.unlink(op_state);
 }
 
-int RGWBucketAdminOp::link(RGWRados *store, RGWBucketAdminOpState& op_state)
+int RGWBucketAdminOp::link(RGWRados *store, RGWBucketAdminOpState& op_state, string *err)
 {
   RGWBucket bucket;
 
@@ -865,7 +876,7 @@ int RGWBucketAdminOp::link(RGWRados *store, RGWBucketAdminOpState& op_state)
   if (ret < 0)
     return ret;
 
-  return bucket.link(op_state);
+  return bucket.link(op_state, err);
 
 }
 

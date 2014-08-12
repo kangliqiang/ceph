@@ -1,12 +1,21 @@
 
-v0.80
+v0.84
 -----
 
-* OSDMap's json-formatted dump changed for keys 'full' and 'nearfull'.
-  What was previously being outputted as 'true' or 'false' strings are
-  now being outputted 'true' and 'false' booleans according to json syntax.
+* The *_kb perf counters on the monitor have been removed.  These are
+  replaced with a new set of *_bytes counters (e.g., cluster_osd_kb is
+  replaced by cluster_osd_bytes).
 
-* HEALTH_WARN on 'mon osd down out interval == 0'. Having this option set
-  to zero on the leader acts much like having the 'noout' flag set.  This
-  warning will only be reported if the monitor getting the 'health' or
-  'status' request has this option set to zero.
+* The rd_kb and wr_kb fields in the JSON dumps for pool stats (accessed via
+  the 'ceph df detail -f json-pretty' and related commands) have been replaced
+  with corresponding *_bytes fields.  Similarly, the 'total_space', 'total_used',
+  and 'total_avail' fields are replaced with 'total_bytes', 'total_used_bytes',
+  and 'total_avail_bytes' fields.
+
+* The client-side caching for librbd is now enabled by default (rbd
+  cache = true).  A safety option (rbd cache writethrough until flush
+  = true) is also enabled so that writeback caching is not used until
+  the library observes a 'flush' command, indicating that the librbd
+  users is passing that operation through from the guest VM.  This
+  avoids potential data loss when used with older versions of qemu
+  that do not support flush.

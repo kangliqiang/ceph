@@ -56,9 +56,11 @@
 #define CEPH_OSD_FEATURE_INCOMPAT_SHARDS CompatSet::Feature(11, "sharded objects")
 
 
-typedef hobject_t collection_list_handle_t;
+/// max recovery priority for MBackfillReserve
+#define OSD_RECOVERY_PRIORITY_MAX 255u
 
-typedef uint8_t shard_id_t;
+
+typedef hobject_t collection_list_handle_t;
 
 /// convert a single CPEH_OSD_FLAG_* to a string
 const char *ceph_osd_flag_name(unsigned flag);
@@ -67,13 +69,13 @@ const char *ceph_osd_flag_name(unsigned flag);
 string ceph_osd_flag_string(unsigned flags);
 
 struct pg_shard_t {
-  int osd;
+  int32_t osd;
   shard_id_t shard;
-  pg_shard_t() : osd(-1), shard(ghobject_t::NO_SHARD) {}
-  explicit pg_shard_t(int osd) : osd(osd), shard(ghobject_t::NO_SHARD) {}
+  pg_shard_t() : osd(-1), shard(shard_id_t::NO_SHARD) {}
+  explicit pg_shard_t(int osd) : osd(osd), shard(shard_id_t::NO_SHARD) {}
   pg_shard_t(int osd, shard_id_t shard) : osd(osd), shard(shard) {}
   static pg_shard_t undefined_shard() {
-    return pg_shard_t(-1, ghobject_t::NO_SHARD);
+    return pg_shard_t(-1, shard_id_t::NO_SHARD);
   }
   bool is_undefined() const {
     return osd == -1;
@@ -311,6 +313,7 @@ struct pg_t {
   }
 
   pg_t get_parent() const;
+  pg_t get_ancestor(unsigned old_pg_num) const;
 
   int print(char *o, int maxlen) const;
   bool parse(const char *s);
@@ -394,9 +397,9 @@ CEPH_HASH_NAMESPACE_END
 struct spg_t {
   pg_t pgid;
   shard_id_t shard;
-  spg_t() : shard(ghobject_t::NO_SHARD) {}
+  spg_t() : shard(shard_id_t::NO_SHARD) {}
   spg_t(pg_t pgid, shard_id_t shard) : pgid(pgid), shard(shard) {}
-  explicit spg_t(pg_t pgid) : pgid(pgid), shard(ghobject_t::NO_SHARD) {}
+  explicit spg_t(pg_t pgid) : pgid(pgid), shard(shard_id_t::NO_SHARD) {}
   unsigned get_split_bits(unsigned pg_num) const {
     return pgid.get_split_bits(pg_num);
   }
@@ -428,7 +431,7 @@ struct spg_t {
     return is_split;
   }
   bool is_no_shard() const {
-    return shard == ghobject_t::NO_SHARD;
+    return shard == shard_id_t::NO_SHARD;
   }
   void encode(bufferlist &bl) const {
     ENCODE_START(1, 1, bl);
@@ -636,7 +639,7 @@ inline bool operator>(const eversion_t& l, const eversion_t& r) {
 inline bool operator>=(const eversion_t& l, const eversion_t& r) {
   return (l.epoch == r.epoch) ? (l.version >= r.version):(l.epoch >= r.epoch);
 }
-inline ostream& operator<<(ostream& out, const eversion_t e) {
+inline ostream& operator<<(ostream& out, const eversion_t& e) {
   return out << e.epoch << "'" << e.version;
 }
 
@@ -810,9 +813,10 @@ struct pg_pool_t {
   }
 
   enum {
-    FLAG_HASHPSPOOL = 1, // hash pg seed and pool together (instead of adding)
-    FLAG_FULL       = 2, // pool is full
+    FLAG_HASHPSPOOL = 1<<0, // hash pg seed and pool together (instead of adding)
+    FLAG_FULL       = 1<<1, // pool is full
     FLAG_DEBUG_FAKE_EC_POOL = 1<<2, // require ReplicatedPG to act like an EC pg
+    FLAG_INCOMPLETE_CLONES = 1<<3, // may have incomplete clones (bc we are/were an overlay)
   };
 
   static const char *get_flag_name(int f) {
@@ -820,6 +824,7 @@ struct pg_pool_t {
     case FLAG_HASHPSPOOL: return "hashpspool";
     case FLAG_FULL: return "full";
     case FLAG_DEBUG_FAKE_EC_POOL: return "require_local_rollback";
+    case FLAG_INCOMPLETE_CLONES: return "incomplete_clones";
     default: return "???";
     }
   }
@@ -843,6 +848,7 @@ struct pg_pool_t {
     CACHEMODE_WRITEBACK = 1,             ///< write to cache, flush later
     CACHEMODE_FORWARD = 2,               ///< forward if not in cache
     CACHEMODE_READONLY = 3,              ///< handle reads, forward writes [not strongly consistent]
+    CACHEMODE_READFORWARD = 4            ///< forward reads, write to cache flush later
   } cache_mode_t;
   static const char *get_cache_mode_name(cache_mode_t m) {
     switch (m) {
@@ -850,6 +856,7 @@ struct pg_pool_t {
     case CACHEMODE_WRITEBACK: return "writeback";
     case CACHEMODE_FORWARD: return "forward";
     case CACHEMODE_READONLY: return "readonly";
+    case CACHEMODE_READFORWARD: return "readforward";
     default: return "unknown";
     }
   }
@@ -862,10 +869,25 @@ struct pg_pool_t {
       return CACHEMODE_FORWARD;
     if (s == "readonly")
       return CACHEMODE_READONLY;
+    if (s == "readforward")
+      return CACHEMODE_READFORWARD;
     return (cache_mode_t)-1;
   }
   const char *get_cache_mode_name() const {
     return get_cache_mode_name(cache_mode);
+  }
+  bool cache_mode_requires_hit_set() const {
+    switch (cache_mode) {
+    case CACHEMODE_NONE:
+    case CACHEMODE_FORWARD:
+    case CACHEMODE_READONLY:
+      return false;
+    case CACHEMODE_WRITEBACK:
+    case CACHEMODE_READFORWARD:
+      return true;
+    default:
+      assert(0 == "implement me");
+    }
   }
 
   uint64_t flags;           ///< FLAG_*
@@ -881,6 +903,7 @@ public:
   map<string,string> properties;  ///< OBSOLETE
   string erasure_code_profile; ///< name of the erasure code profile in OSDMap
   epoch_t last_change;      ///< most recent epoch changed, exclusing snapshot changes
+  epoch_t last_force_op_resend; ///< last epoch that forced clients to resend
   snapid_t snap_seq;        ///< seq for per-pool snapshot
   epoch_t snap_epoch;       ///< osdmap epoch of last snap
   uint64_t auid;            ///< who owns the pg
@@ -913,11 +936,30 @@ public:
   cache_mode_t cache_mode;  ///< cache pool mode
 
   bool is_tier() const { return tier_of >= 0; }
-  void clear_tier() { tier_of = -1; }
+  bool has_tiers() const { return !tiers.empty(); }
+  void clear_tier() {
+    tier_of = -1;
+    clear_read_tier();
+    clear_write_tier();
+    clear_tier_tunables();
+  }
   bool has_read_tier() const { return read_tier >= 0; }
   void clear_read_tier() { read_tier = -1; }
   bool has_write_tier() const { return write_tier >= 0; }
   void clear_write_tier() { write_tier = -1; }
+  void clear_tier_tunables() {
+    if (cache_mode != CACHEMODE_NONE)
+      flags |= FLAG_INCOMPLETE_CLONES;
+    cache_mode = CACHEMODE_NONE;
+
+    target_max_bytes = 0;
+    target_max_objects = 0;
+    cache_target_dirty_ratio_micro = 0;
+    cache_target_full_ratio_micro = 0;
+    hit_set_params = HitSet::Params();
+    hit_set_period = 0;
+    hit_set_count = 0;
+  }
 
   uint64_t target_max_bytes;   ///< tiering: target max pool size
   uint64_t target_max_objects; ///< tiering: target max pool size
@@ -931,6 +973,7 @@ public:
   HitSet::Params hit_set_params; ///< The HitSet params to use on this pool
   uint32_t hit_set_period;      ///< periodicity of HitSet segments (seconds)
   uint32_t hit_set_count;       ///< number of periods to retain
+  uint32_t min_read_recency_for_promote;   ///< minimum number of HitSet to check before promote
 
   uint32_t stripe_width;        ///< erasure coded stripe size in bytes
 
@@ -939,6 +982,7 @@ public:
       crush_ruleset(0), object_hash(0),
       pg_num(0), pgp_num(0),
       last_change(0),
+      last_force_op_resend(0),
       snap_seq(0), snap_epoch(0),
       auid(0),
       crash_replay_interval(0),
@@ -954,12 +998,14 @@ public:
       hit_set_params(),
       hit_set_period(0),
       hit_set_count(0),
+      min_read_recency_for_promote(0),
       stripe_width(0)
   { }
 
   void dump(Formatter *f) const;
 
   uint64_t get_flags() const { return flags; }
+  bool has_flag(uint64_t f) const { return flags & f; }
 
   /// This method will later return true for ec pools as well
   bool ec_pool() const {
@@ -967,6 +1013,11 @@ public:
   }
   bool require_rollback() const {
     return ec_pool() || flags & FLAG_DEBUG_FAKE_EC_POOL;
+  }
+
+  /// true if incomplete clones may be present
+  bool allow_incomplete_clones() const {
+    return cache_mode != CACHEMODE_NONE || has_flag(FLAG_INCOMPLETE_CLONES);
   }
 
   unsigned get_type() const { return type; }
@@ -978,6 +1029,7 @@ public:
     return ceph_str_hash_name(get_object_hash());
   }
   epoch_t get_last_change() const { return last_change; }
+  epoch_t get_last_force_op_resend() const { return last_force_op_resend; }
   epoch_t get_snap_epoch() const { return snap_epoch; }
   snapid_t get_snap_seq() const { return snap_seq; }
   uint64_t get_auid() const { return auid; }
@@ -1125,6 +1177,7 @@ struct object_stat_sum_t {
   int64_t num_objects_dirty;
   int64_t num_whiteouts;
   int64_t num_objects_omap;
+  int64_t num_objects_hit_set_archive;
 
   object_stat_sum_t()
     : num_bytes(0),
@@ -1138,7 +1191,8 @@ struct object_stat_sum_t {
       num_keys_recovered(0),
       num_objects_dirty(0),
       num_whiteouts(0),
-      num_objects_omap(0)
+      num_objects_omap(0),
+      num_objects_hit_set_archive(0)
   {}
 
   void floor(int64_t f) {
@@ -1163,6 +1217,7 @@ struct object_stat_sum_t {
     FLOOR(num_objects_dirty);
     FLOOR(num_whiteouts);
     FLOOR(num_objects_omap);
+    FLOOR(num_objects_hit_set_archive);
 #undef FLOOR
   }
 
@@ -1195,6 +1250,7 @@ struct object_stat_sum_t {
     SPLIT(num_objects_dirty);
     SPLIT(num_whiteouts);
     SPLIT(num_objects_omap);
+    SPLIT(num_objects_hit_set_archive);
 #undef SPLIT
   }
 
@@ -1326,10 +1382,11 @@ struct pg_stat_t {
   /// maintained starting from pool creation)
   bool dirty_stats_invalid;
   bool omap_stats_invalid;
+  bool hitset_stats_invalid;
 
   /// up, acting primaries
-  int up_primary;
-  int acting_primary;
+  int32_t up_primary;
+  int32_t acting_primary;
 
   pg_stat_t()
     : reported_seq(0),
@@ -1342,6 +1399,7 @@ struct pg_stat_t {
       mapping_epoch(0),
       dirty_stats_invalid(false),
       omap_stats_invalid(false),
+      hitset_stats_invalid(false),
       up_primary(-1),
       acting_primary(-1)
   { }
@@ -1651,8 +1709,8 @@ struct pg_notify_t {
   shard_id_t to;
   shard_id_t from;
   pg_notify_t() :
-    query_epoch(0), epoch_sent(0), to(ghobject_t::no_shard()),
-    from(ghobject_t::no_shard()) {}
+    query_epoch(0), epoch_sent(0), to(shard_id_t::NO_SHARD),
+    from(shard_id_t::NO_SHARD) {}
   pg_notify_t(
     shard_id_t to,
     shard_id_t from,
@@ -1678,12 +1736,18 @@ ostream &operator<<(ostream &lhs, const pg_notify_t &notify);
  */
 class OSDMap;
 struct pg_interval_t {
-  vector<int> up, acting;
+  vector<int32_t> up, acting;
   epoch_t first, last;
   bool maybe_went_rw;
-  int primary;
+  int32_t primary;
+  int32_t up_primary;
 
-  pg_interval_t() : first(0), last(0), maybe_went_rw(false), primary(-1) {}
+  pg_interval_t()
+    : first(0), last(0),
+      maybe_went_rw(false),
+      primary(-1),
+      up_primary(-1)
+  {}
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
@@ -1691,21 +1755,39 @@ struct pg_interval_t {
   static void generate_test_instances(list<pg_interval_t*>& o);
 
   /**
+   * Determines whether there is an interval change
+   */
+  static bool is_new_interval(
+    int old_acting_primary,                     ///< [in] primary as of lastmap
+    int new_acting_primary,                     ///< [in] primary as of lastmap
+    const vector<int> &old_acting,              ///< [in] acting as of lastmap
+    const vector<int> &new_acting,              ///< [in] acting as of osdmap
+    int old_up_primary,                         ///< [in] up primary of lastmap
+    int new_up_primary,                         ///< [in] up primary of osdmap
+    const vector<int> &old_up,                  ///< [in] up as of lastmap
+    const vector<int> &new_up,                  ///< [in] up as of osdmap
+    ceph::shared_ptr<const OSDMap> osdmap,  ///< [in] current map
+    ceph::shared_ptr<const OSDMap> lastmap, ///< [in] last map
+    pg_t pgid                                   ///< [in] pgid for pg
+    );
+
+  /**
    * Integrates a new map into *past_intervals, returns true
    * if an interval was closed out.
    */
   static bool check_new_interval(
-    int old_primary,                            ///< [in] primary as of lastmap
-    int new_primary,                            ///< [in] primary as of lastmap
+    int old_acting_primary,                     ///< [in] primary as of lastmap
+    int new_acting_primary,                     ///< [in] primary as of osdmap
     const vector<int> &old_acting,              ///< [in] acting as of lastmap
     const vector<int> &new_acting,              ///< [in] acting as of osdmap
+    int old_up_primary,                         ///< [in] up primary of lastmap
+    int new_up_primary,                         ///< [in] up primary of osdmap
     const vector<int> &old_up,                  ///< [in] up as of lastmap
     const vector<int> &new_up,                  ///< [in] up as of osdmap
     epoch_t same_interval_since,                ///< [in] as of osdmap
     epoch_t last_epoch_clean,                   ///< [in] current
     ceph::shared_ptr<const OSDMap> osdmap,  ///< [in] current map
     ceph::shared_ptr<const OSDMap> lastmap, ///< [in] last map
-    int64_t poolid,                             ///< [in] pool for pg
     pg_t pgid,                                  ///< [in] pgid for pg
     map<epoch_t, pg_interval_t> *past_intervals,///< [out] intervals
     ostream *out = 0                            ///< [out] debug ostream
@@ -1747,8 +1829,8 @@ struct pg_query_t {
   shard_id_t to;
   shard_id_t from;
 
-  pg_query_t() : type(-1), epoch_sent(0), to(ghobject_t::NO_SHARD),
-		 from(ghobject_t::NO_SHARD) {}
+  pg_query_t() : type(-1), epoch_sent(0), to(shard_id_t::NO_SHARD),
+		 from(shard_id_t::NO_SHARD) {}
   pg_query_t(
     int t,
     shard_id_t to,
@@ -1792,7 +1874,7 @@ inline ostream& operator<<(ostream& out, const pg_query_t& q) {
 class PGBackend;
 class ObjectModDesc {
   bool can_local_rollback;
-  bool stashed;
+  bool rollback_info_completed;
 public:
   class Visitor {
   public:
@@ -1812,22 +1894,22 @@ public:
     CREATE = 4,
     UPDATE_SNAPS = 5
   };
-  ObjectModDesc() : can_local_rollback(true), stashed(false) {}
+  ObjectModDesc() : can_local_rollback(true), rollback_info_completed(false) {}
   void claim(ObjectModDesc &other) {
     bl.clear();
     bl.claim(other.bl);
     can_local_rollback = other.can_local_rollback;
-    stashed = other.stashed;
+    rollback_info_completed = other.rollback_info_completed;
   }
   void claim_append(ObjectModDesc &other) {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return;
     if (!other.can_local_rollback) {
       mark_unrollbackable();
       return;
     }
     bl.claim_append(other.bl);
-    stashed = other.stashed;
+    rollback_info_completed = other.rollback_info_completed;
   }
   void swap(ObjectModDesc &other) {
     bl.swap(other.bl);
@@ -1836,16 +1918,16 @@ public:
     other.can_local_rollback = can_local_rollback;
     can_local_rollback = temp;
 
-    temp = other.stashed;
-    other.stashed = stashed;
-    stashed = temp;
+    temp = other.rollback_info_completed;
+    other.rollback_info_completed = rollback_info_completed;
+    rollback_info_completed = temp;
   }
   void append_id(ModID id) {
     uint8_t _id(id);
     ::encode(_id, bl);
   }
   void append(uint64_t old_size) {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return;
     ENCODE_START(1, 1, bl);
     append_id(APPEND);
@@ -1853,7 +1935,7 @@ public:
     ENCODE_FINISH(bl);
   }
   void setattrs(map<string, boost::optional<bufferlist> > &old_attrs) {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return;
     ENCODE_START(1, 1, bl);
     append_id(SETATTRS);
@@ -1861,24 +1943,25 @@ public:
     ENCODE_FINISH(bl);
   }
   bool rmobject(version_t deletion_version) {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return false;
     ENCODE_START(1, 1, bl);
     append_id(DELETE);
     ::encode(deletion_version, bl);
     ENCODE_FINISH(bl);
-    stashed = true;
+    rollback_info_completed = true;
     return true;
   }
   void create() {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return;
+    rollback_info_completed = true;
     ENCODE_START(1, 1, bl);
     append_id(CREATE);
     ENCODE_FINISH(bl);
   }
   void update_snaps(set<snapid_t> &old_snaps) {
-    if (!can_local_rollback || stashed)
+    if (!can_local_rollback || rollback_info_completed)
       return;
     ENCODE_START(1, 1, bl);
     append_id(UPDATE_SNAPS);
@@ -2041,6 +2124,10 @@ struct pg_log_t {
 
   // We can rollback rollback-able entries > can_rollback_to
   eversion_t can_rollback_to;
+
+  // always <= can_rollback_to, indicates how far stashed rollback
+  // data can be found
+  eversion_t rollback_info_trimmed_to;
 
   list<pg_log_entry_t> log;  // the actual log.
   
@@ -2529,6 +2616,7 @@ struct object_info_t {
 
   uint64_t size;
   utime_t mtime;
+  utime_t local_mtime; // local mtime
 
   // note: these are currently encoded into a total 16 bits; see
   // encode()/decode() for the weirdness.
@@ -2675,6 +2763,7 @@ public:
   // set if writes for this object are blocked on another objects recovery
   ObjectContextRef blocked_by;      // object blocking our writes
   set<ObjectContextRef> blocking;   // objects whose writes we block
+  bool requeue_scrub_on_unblock;    // true if we need to requeue scrub on unblock
 
   // any entity in obs.oi.watchers MUST be in either watchers or unconnected_watchers.
   map<pair<uint64_t, entity_name_t>, WatchRef> watchers;
@@ -2704,7 +2793,15 @@ public:
     /// if set, restart backfill when we can get a read lock
     bool backfill_read_marker;
 
-    RWState() : state(RWNONE), count(0), backfill_read_marker(false) {}
+    /// if set, requeue snaptrim on lock release
+    bool snaptrimmer_write_marker;
+
+    RWState()
+      : state(RWNONE),
+	count(0),
+	backfill_read_marker(false),
+	snaptrimmer_write_marker(false)
+    {}
     bool get_read(OpRequestRef op) {
       if (get_read_lock()) {
 	return true;
@@ -2734,19 +2831,21 @@ public:
       }
     }
 
-    bool get_write(OpRequestRef op) {
-      if (get_write_lock()) {
+    bool get_write(OpRequestRef op, bool greedy=false) {
+      if (get_write_lock(greedy)) {
 	return true;
       } // else
       if (op)
 	waiters.push_back(op);
       return false;
     }
-    bool get_write_lock() {
-      // don't starve anybody!
-      if (!waiters.empty() ||
-	  backfill_read_marker) {
-	return false;
+    bool get_write_lock(bool greedy=false) {
+      if (!greedy) {
+	// don't starve anybody!
+	if (!waiters.empty() ||
+	    backfill_read_marker) {
+	  return false;
+	}
       }
       switch (state) {
       case RWNONE:
@@ -2795,7 +2894,18 @@ public:
     return rwstate.get_read(op);
   }
   bool get_write(OpRequestRef op) {
-    return rwstate.get_write(op);
+    return rwstate.get_write(op, false);
+  }
+  bool get_write_greedy(OpRequestRef op) {
+    return rwstate.get_write(op, true);
+  }
+  bool get_snaptrimmer_write() {
+    if (rwstate.get_write_lock()) {
+      return true;
+    } else {
+      rwstate.snaptrimmer_write_marker = true;
+      return false;
+    }
   }
   bool get_backfill_read() {
     rwstate.backfill_read_marker = true;
@@ -2813,11 +2923,16 @@ public:
     rwstate.put_read(to_wake);
   }
   void put_write(list<OpRequestRef> *to_wake,
-		 bool *requeue_recovery) {
+		 bool *requeue_recovery,
+		 bool *requeue_snaptrimmer) {
     rwstate.put_write(to_wake);
     if (rwstate.empty() && rwstate.backfill_read_marker) {
       rwstate.backfill_read_marker = false;
       *requeue_recovery = true;
+    }
+    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
+      rwstate.snaptrimmer_write_marker = false;
+      *requeue_snaptrimmer = true;
     }
   }
 
@@ -2826,7 +2941,7 @@ public:
       destructor_callback(0),
       lock("ReplicatedPG::ObjectContext::lock"),
       unstable_writes(0), readers(0), writers_waiting(0), readers_waiting(0),
-      blocked(false) {}
+      blocked(false), requeue_scrub_on_unblock(false) {}
 
   ~ObjectContext() {
     assert(rwstate.empty());

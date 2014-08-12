@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <errno.h>
 
 #include "json_spirit/json_spirit.h"
@@ -493,13 +496,13 @@ int NameVal::parse()
 
 int XMLArgs::parse()
 {
-  int pos = 0, fpos;
+  int pos = 0;
   bool end = false;
   bool admin_subresource_added = false; 
   if (str[pos] == '?') pos++;
 
   while (!end) {
-    fpos = str.find('&', pos);
+    int fpos = str.find('&', pos);
     if (fpos  < pos) {
        end = true;
        fpos = str.size(); 
@@ -697,13 +700,15 @@ bool url_decode(string& src_str, string& dest_str)
   int pos = 0;
   char c;
 
+  bool in_query = false;
   while (*src) {
     if (*src != '%') {
-      if (*src != '+') {
-	dest[pos++] = *src++;
+      if (!in_query || *src != '+') {
+        if (*src == '?') in_query = true;
+        dest[pos++] = *src++;
       } else {
-	dest[pos++] = ' ';
-	++src;
+        dest[pos++] = ' ';
+        ++src;
       }
     } else {
       src++;
@@ -731,7 +736,7 @@ bool url_decode(string& src_str, string& dest_str)
 static void escape_char(char c, string& dst)
 {
   char buf[16];
-  snprintf(buf, sizeof(buf), "%%%.2X", (unsigned int)c);
+  snprintf(buf, sizeof(buf), "%%%.2X", (int)(unsigned char)c);
   dst.append(buf);
 }
 

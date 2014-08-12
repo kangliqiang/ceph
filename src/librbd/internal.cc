@@ -475,16 +475,16 @@ namespace librbd {
 			      snapid_t oursnap_id)
   {
     if (pspec.pool_id != -1) {
-      map<string, SnapInfo>::iterator it;
-      for (it = ictx->snaps_by_name.begin();
-	   it != ictx->snaps_by_name.end(); ++it) {
+      map<snap_t, SnapInfo>::iterator it;
+      for (it = ictx->snap_info.begin();
+	   it != ictx->snap_info.end(); ++it) {
 	// skip our snap id (if checking base image, CEPH_NOSNAP won't match)
-	if (it->second.id == oursnap_id)
+	if (it->first == oursnap_id)
 	  continue;
 	if (it->second.parent.spec == pspec)
 	  break;
       }
-      if (it == ictx->snaps_by_name.end())
+      if (it == ictx->snap_info.end())
 	return -ENOENT;
     }
     return 0;
@@ -569,7 +569,7 @@ namespace librbd {
       return -ENOENT;
 
     bool is_protected;
-    r = ictx->is_snap_protected(snap_name, &is_protected);
+    r = ictx->is_snap_protected(snap_id, &is_protected);
     if (r < 0)
       return r;
 
@@ -612,7 +612,7 @@ namespace librbd {
       return -ENOENT;
 
     bool is_unprotected;
-    r = ictx->is_snap_unprotected(snap_name, &is_unprotected);
+    r = ictx->is_snap_unprotected(snap_id, &is_unprotected);
     if (r < 0)
       return r;
 
@@ -664,6 +664,11 @@ namespace librbd {
 					  ictx->header_oid,
 					  snap_id,
 					  RBD_PROTECTION_STATUS_UNPROTECTED);
+    if (r < 0) {
+      lderr(ictx->cct) << "snap_unprotect: error setting unprotected status"
+		       << dendl;
+      goto reprotect_and_return_err;
+    }
     notify_change(ictx->md_ctx, ictx->header_oid, NULL, ictx);
     return 0;
 
@@ -690,8 +695,11 @@ reprotect_and_return_err:
       return r;
 
     RWLock::RLocker l(ictx->snap_lock);
+    snap_t snap_id = ictx->get_snap_id(snap_name);
+    if (snap_id == CEPH_NOSNAP)
+      return -ENOENT;
     bool is_unprotected;
-    r = ictx->is_snap_unprotected(snap_name, &is_unprotected);
+    r = ictx->is_snap_unprotected(snap_id, &is_unprotected);
     // consider both PROTECTED or UNPROTECTING to be 'protected',
     // since in either state they can't be deleted
     *is_protected = !is_unprotected;
@@ -832,6 +840,9 @@ reprotect_and_return_err:
 	     bool old_format, uint64_t features, int *order,
 	     uint64_t stripe_unit, uint64_t stripe_count)
   {
+    if (!order)
+      return -EINVAL;
+
     CephContext *cct = (CephContext *)io_ctx.cct();
     ldout(cct, 20) << "create " << &io_ctx << " name = " << imgname
 		   << " size = " << size << " old_format = " << old_format
@@ -856,9 +867,6 @@ reprotect_and_return_err:
       lderr(cct) << "rbd image " << imgname << " already exists" << dendl;
       return -EEXIST;
     }
-
-    if (!order)
-      return -EINVAL;
 
     if (!*order)
       *order = cct->_conf->rbd_default_order;
@@ -970,7 +978,7 @@ reprotect_and_return_err:
     p_imctx->snap_lock.get_read();
     p_imctx->get_features(p_imctx->snap_id, &p_features);
     size = p_imctx->get_image_size(p_imctx->snap_id);
-    p_imctx->is_snap_protected(p_imctx->snap_name, &snap_protected);
+    p_imctx->is_snap_protected(p_imctx->snap_id, &snap_protected);
     p_imctx->snap_lock.put_read();
     p_imctx->md_lock.put_read();
 
@@ -1022,7 +1030,7 @@ reprotect_and_return_err:
 
     if (r == 0) {
       p_imctx->snap_lock.get_read();
-      r = p_imctx->is_snap_protected(p_imctx->snap_name, &snap_protected);
+      r = p_imctx->is_snap_protected(p_imctx->snap_id, &snap_protected);
       p_imctx->snap_lock.put_read();
     }
     if (r < 0 || !snap_protected) {
@@ -1275,6 +1283,19 @@ reprotect_and_return_err:
       return r;
     }
     ictx->parent->snap_set(ictx->parent->snap_name);
+    ictx->parent->parent_lock.get_write();
+    r = refresh_parent(ictx->parent);
+    if (r < 0) {
+      lderr(ictx->cct) << "error refreshing parent snapshot "
+		       << ictx->parent->id << " "
+		       << ictx->parent->snap_name << dendl;
+      ictx->parent->parent_lock.put_write();
+      ictx->parent->snap_lock.put_write();
+      close_image(ictx->parent);
+      ictx->parent = NULL;
+      return r;
+    }
+    ictx->parent->parent_lock.put_write();
     ictx->parent->snap_lock.put_write();
 
     return 0;
@@ -1504,7 +1525,9 @@ reprotect_and_return_err:
     if (size < ictx->size && ictx->object_cacher) {
       // need to invalidate since we're deleting objects, and
       // ObjectCacher doesn't track non-existent objects
-      ictx->invalidate_cache();
+      r = ictx->invalidate_cache();
+      if (r < 0)
+	return r;
     }
     resize_helper(ictx, size, prog_ctx);
 
@@ -1524,11 +1547,11 @@ reprotect_and_return_err:
     bufferlist bl, bl2;
 
     RWLock::RLocker l(ictx->snap_lock);
-    for (map<string, SnapInfo>::iterator it = ictx->snaps_by_name.begin();
-	 it != ictx->snaps_by_name.end(); ++it) {
+    for (map<snap_t, SnapInfo>::iterator it = ictx->snap_info.begin();
+	 it != ictx->snap_info.end(); ++it) {
       snap_info_t info;
-      info.name = it->first;
-      info.id = it->second.id;
+      info.name = it->second.name;
+      info.id = it->first;
       info.size = it->second.size;
       snaps.push_back(info);
     }
@@ -1545,7 +1568,7 @@ reprotect_and_return_err:
       return r;
 
     RWLock::RLocker l(ictx->snap_lock);
-    return ictx->snaps_by_name.count(snap_name);
+    return ictx->get_snap_id(snap_name) != CEPH_NOSNAP;
   }
 
 
@@ -1768,7 +1791,8 @@ reprotect_and_return_err:
 	}
 
 	ictx->snaps.clear();
-	ictx->snaps_by_name.clear();
+	ictx->snap_info.clear();
+	ictx->snap_ids.clear();
 	for (size_t i = 0; i < new_snapc.snaps.size(); ++i) {
 	  uint64_t features = ictx->old_format ? 0 : snap_features[i];
 	  uint8_t protection_status = ictx->old_format ?
@@ -1847,7 +1871,9 @@ reprotect_and_return_err:
     // need to flush any pending writes before resizing and rolling back -
     // writes might create new snapshots. Rolling back will replace
     // the current version, so we have to invalidate that too.
-    ictx->invalidate_cache();
+    r = ictx->invalidate_cache();
+    if (r < 0)
+      return r;
 
     ldout(cct, 2) << "resizing to snapshot size..." << dendl;
     NoOpProgressContext no_op;
@@ -2875,6 +2901,19 @@ reprotect_and_return_err:
       lderr(cct) << "_flush " << ictx << " r = " << r << dendl;
 
     return r;
+  }
+
+  int invalidate_cache(ImageCtx *ictx)
+  {
+    CephContext *cct = ictx->cct;
+    ldout(cct, 20) << "invalidate_cache " << ictx << dendl;
+
+    int r = ictx_check(ictx);
+    if (r < 0)
+      return r;
+
+    RWLock::WLocker l(ictx->md_lock);
+    return ictx->invalidate_cache();
   }
 
   int aio_write(ImageCtx *ictx, uint64_t off, size_t len, const char *buf,

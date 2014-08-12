@@ -48,7 +48,10 @@
 #include "common/safe_io.h"
 #include "common/perf_counters.h"
 #include "common/sync_filesystem.h"
-#include "LevelDBStore.h"
+
+#ifdef HAVE_KINETIC
+#include "KineticStore.h"
+#endif
 
 #include "common/ceph_crypto.h"
 using ceph::crypto::SHA1;
@@ -67,70 +70,69 @@ const string KeyValueStore::OBJECT_OMAP_HEADER_KEY = "__OBJOMAP_HEADER__KEY_";
 const string KeyValueStore::COLLECTION = "__COLLECTION__";
 const string KeyValueStore::COLLECTION_ATTR = "__COLL_ATTR__";
 
+
+//Initial features in new superblock.
+static CompatSet get_kv_initial_compat_set() {
+  CompatSet::FeatureSet ceph_osd_feature_compat;
+  CompatSet::FeatureSet ceph_osd_feature_ro_compat;
+  CompatSet::FeatureSet ceph_osd_feature_incompat;
+  return CompatSet(ceph_osd_feature_compat, ceph_osd_feature_ro_compat,
+		   ceph_osd_feature_incompat);
+}
+
+//Features are added here that this KeyValueStore supports.
+static CompatSet get_kv_supported_compat_set() {
+  CompatSet compat =  get_kv_initial_compat_set();
+  //Any features here can be set in code, but not in initial superblock
+  return compat;
+}
+
+
 // ============== StripObjectMap Implementation =================
 
-void StripObjectMap::sync_wrap(StripObjectHeader &strip_header,
-                               KeyValueDB::Transaction t,
-                               const SequencerPosition &spos)
-{
-  dout(10) << __func__ << " cid: " << strip_header.cid << "oid: "
-           << strip_header.oid << " setting spos to " << strip_header.spos
-           << dendl;
-  strip_header.spos = spos;
-  strip_header.header->data.clear();
-  ::encode(strip_header, strip_header.header->data);
-
-  sync(strip_header.header, t);
-}
-
-bool StripObjectMap::check_spos(const StripObjectHeader &header,
-                                const SequencerPosition &spos)
-{
-  if (spos > header.spos) {
-    stringstream out;
-    dout(10) << "cid: " << "oid: " << header.oid
-             << " not skipping op, *spos " << spos << dendl;
-    dout(10) << " > header.spos " << header.spos << dendl;
-    return false;
-  } else {
-    dout(10) << "cid: " << "oid: " << header.oid << " skipping op, spos "
-             << spos << " <= header.spos " << header.spos << dendl;
-    return true;
-  }
-}
-
-int StripObjectMap::save_strip_header(StripObjectHeader &strip_header,
-                                      const SequencerPosition &spos,
+int StripObjectMap::save_strip_header(StripObjectHeaderRef strip_header,
                                       KeyValueDB::Transaction t)
 {
-  strip_header.spos = spos;
-  strip_header.header->data.clear();
-  ::encode(strip_header, strip_header.header->data);
+  strip_header->header->data.clear();
+  ::encode(*strip_header, strip_header->header->data);
 
-  set_header(strip_header.cid, strip_header.oid, *(strip_header.header), t);
+  set_header(strip_header->cid, strip_header->oid, *(strip_header->header), t);
   return 0;
 }
 
 int StripObjectMap::create_strip_header(const coll_t &cid,
                                         const ghobject_t &oid,
-                                        StripObjectHeader &strip_header,
+                                        StripObjectHeaderRef *strip_header,
                                         KeyValueDB::Transaction t)
 {
-  Header header = lookup_create_header(cid, oid, t);
+  Header header = generate_new_header(cid, oid, Header(), t);
   if (!header)
     return -EINVAL;
 
-  strip_header.oid = oid;
-  strip_header.cid = cid;
-  strip_header.header = header;
+  StripObjectHeaderRef tmp = StripObjectHeaderRef(new StripObjectHeader());
+  tmp->oid = oid;
+  tmp->cid = cid;
+  tmp->header = header;
+  if (strip_header)
+    *strip_header = tmp;
 
   return 0;
 }
 
 int StripObjectMap::lookup_strip_header(const coll_t &cid,
                                         const ghobject_t &oid,
-                                        StripObjectHeader &strip_header)
+                                        StripObjectHeaderRef *strip_header)
 {
+  if (cid != coll_t()) {
+    Mutex::Locker l(lock);
+    pair<coll_t, StripObjectHeaderRef> p;
+    if (caches.lookup(oid, &p)) {
+      if (p.first == cid) {
+        *strip_header = p.second;
+        return 0;
+      }
+    }
+  }
   Header header = lookup_header(cid, oid);
 
   if (!header) {
@@ -139,18 +141,25 @@ int StripObjectMap::lookup_strip_header(const coll_t &cid,
     return -ENOENT;
   }
 
+
+  StripObjectHeaderRef tmp = StripObjectHeaderRef(new StripObjectHeader());
   if (header->data.length()) {
     bufferlist::iterator bliter = header->data.begin();
-    ::decode(strip_header, bliter);
+    ::decode(*tmp, bliter);
   }
 
-  if (strip_header.strip_size == 0)
-    strip_header.strip_size = default_strip_size;
+  if (tmp->strip_size == 0)
+    tmp->strip_size = default_strip_size;
 
-  strip_header.oid = oid;
-  strip_header.cid = cid;
-  strip_header.header = header;
+  tmp->oid = oid;
+  tmp->cid = cid;
+  tmp->header = header;
 
+  {
+    Mutex::Locker l(lock);
+    caches.add(oid, make_pair(cid, tmp));
+  }
+  *strip_header = tmp;
   dout(10) << "lookup_strip_header done " << " cid " << cid << " oid "
            << oid << dendl;
   return 0;
@@ -194,54 +203,62 @@ int StripObjectMap::file_to_extents(uint64_t offset, size_t len,
   return 0;
 }
 
-void StripObjectMap::clone_wrap(StripObjectHeader &old_header,
+void StripObjectMap::clone_wrap(StripObjectHeaderRef old_header,
                                 const coll_t &cid, const ghobject_t &oid,
                                 KeyValueDB::Transaction t,
-                                StripObjectHeader *origin_header,
-                                StripObjectHeader *target_header)
+                                StripObjectHeaderRef *target_header)
 {
   Header new_origin_header;
+  StripObjectHeaderRef tmp = StripObjectHeaderRef(new StripObjectHeader());
+
+  clone(old_header->header, cid, oid, t, &new_origin_header,
+        &tmp->header);
+
+  tmp->oid = oid;
+  tmp->cid = cid;
+  tmp->strip_size = old_header->strip_size;
+  tmp->max_size = old_header->max_size;
+  tmp->bits = old_header->bits;
+  old_header->header = new_origin_header;
 
   if (target_header)
-    *target_header = old_header;
-
-  clone(old_header.header, cid, oid, t, &new_origin_header,
-        &target_header->header);
-
-  old_header.header = new_origin_header;
-
-  if (target_header) {
-    target_header->oid = oid;
-    target_header->cid = cid;
-  }
+    *target_header = tmp;
 }
 
-void StripObjectMap::rename_wrap(const coll_t &cid, const ghobject_t &oid,
+void StripObjectMap::rename_wrap(StripObjectHeaderRef old_header, const coll_t &cid, const ghobject_t &oid,
                                  KeyValueDB::Transaction t,
-                                 StripObjectHeader *header)
+                                 StripObjectHeaderRef *new_header)
 {
-  assert(header);
-  rename(header->header, cid, oid, t);
+  rename(old_header->header, cid, oid, t);
 
-  if (header) {
-    header->oid = oid;
-    header->cid = cid;
-  }
+  StripObjectHeaderRef tmp = StripObjectHeaderRef(new StripObjectHeader());
+  tmp->strip_size = old_header->strip_size;
+  tmp->max_size = old_header->max_size;
+  tmp->bits = old_header->bits;
+  tmp->header = old_header->header;
+  tmp->oid = oid;
+  tmp->cid = cid;
+
+  if (new_header)
+    *new_header = tmp;
+
+  old_header->header = Header();
+  old_header->deleted = true;
 }
 
-int StripObjectMap::get_values_with_header(const StripObjectHeader &header,
+int StripObjectMap::get_values_with_header(const StripObjectHeaderRef header,
                                            const string &prefix,
                                            const set<string> &keys,
                                            map<string, bufferlist> *out)
 {
-  return scan(header.header, prefix, keys, 0, out);
+  return scan(header->header, prefix, keys, 0, out);
 }
 
-int StripObjectMap::get_keys_with_header(const StripObjectHeader &header,
+int StripObjectMap::get_keys_with_header(const StripObjectHeaderRef header,
                                          const string &prefix,
                                          set<string> *keys)
 {
-  ObjectMap::ObjectMapIterator iter = _get_iterator(header.header, prefix);
+  ObjectMap::ObjectMapIterator iter = _get_iterator(header->header, prefix);
   for (; iter->valid(); iter->next()) {
     if (iter->status())
       return iter->status();
@@ -250,10 +267,10 @@ int StripObjectMap::get_keys_with_header(const StripObjectHeader &header,
   return 0;
 }
 
-int StripObjectMap::get_with_header(const StripObjectHeader &header,
+int StripObjectMap::get_with_header(const StripObjectHeaderRef header,
                         const string &prefix, map<string, bufferlist> *out)
 {
-  ObjectMap::ObjectMapIterator iter = _get_iterator(header.header, prefix);
+  ObjectMap::ObjectMapIterator iter = _get_iterator(header->header, prefix);
   for (iter->seek_to_first(); iter->valid(); iter->next()) {
     if (iter->status())
       return iter->status();
@@ -262,52 +279,36 @@ int StripObjectMap::get_with_header(const StripObjectHeader &header,
 
   return 0;
 }
-// =========== KeyValueStore::SubmitManager Implementation ==============
-
-uint64_t KeyValueStore::SubmitManager::op_submit_start()
-{
-  lock.Lock();
-  uint64_t op = ++op_seq;
-  dout(10) << "op_submit_start " << op << dendl;
-  return op;
-}
-
-void KeyValueStore::SubmitManager::op_submit_finish(uint64_t op)
-{
-  dout(10) << "op_submit_finish " << op << dendl;
-  if (op != op_submitted + 1) {
-      dout(0) << "op_submit_finish " << op << " expected " << (op_submitted + 1)
-          << ", OUT OF ORDER" << dendl;
-      assert(0 == "out of order op_submit_finish");
-  }
-  op_submitted = op;
-  lock.Unlock();
-}
-
 
 // ========= KeyValueStore::BufferTransaction Implementation ============
 
 int KeyValueStore::BufferTransaction::lookup_cached_header(
     const coll_t &cid, const ghobject_t &oid,
-    StripObjectMap::StripObjectHeader **strip_header,
+    StripObjectMap::StripObjectHeaderRef *strip_header,
     bool create_if_missing)
 {
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
   int r = 0;
 
   StripHeaderMap::iterator it = strip_headers.find(make_pair(cid, oid));
   if (it != strip_headers.end()) {
-    if (it->second.deleted)
-      return -ENOENT;
 
-    if (strip_header)
-      *strip_header = &it->second;
-    return 0;
+    if (!it->second->deleted) {
+      if (strip_header)
+        *strip_header = it->second;
+      return 0;
+    } else if (!create_if_missing) {
+      return -ENOENT;
+    }
+
+    // If (it->second.deleted && create_if_missing) go down
+    r = -ENOENT;
+  } else {
+    r = store->backend->lookup_strip_header(cid, oid, &header);
   }
 
-  r = store->backend->lookup_strip_header(cid, oid, header);
-  if (r < 0 && create_if_missing) {
-    r = store->backend->create_strip_header(cid, oid, header, t);
+  if (r == -ENOENT && create_if_missing) {
+    r = store->backend->create_strip_header(cid, oid, &header, t);
   }
 
   if (r < 0) {
@@ -318,21 +319,21 @@ int KeyValueStore::BufferTransaction::lookup_cached_header(
 
   strip_headers[make_pair(cid, oid)] = header;
   if (strip_header)
-    *strip_header = &strip_headers[make_pair(cid, oid)];
+    *strip_header = strip_headers[make_pair(cid, oid)];
   return r;
 }
 
 int KeyValueStore::BufferTransaction::get_buffer_keys(
-    StripObjectMap::StripObjectHeader &strip_header, const string &prefix,
+    StripObjectMap::StripObjectHeaderRef strip_header, const string &prefix,
     const set<string> &keys, map<string, bufferlist> *out)
 {
   set<string> need_lookup;
 
   for (set<string>::iterator it = keys.begin(); it != keys.end(); ++it) {
     map<pair<string, string>, bufferlist>::iterator i =
-        strip_header.buffers.find(make_pair(prefix, *it));
+        strip_header->buffers.find(make_pair(prefix, *it));
 
-    if (i != strip_header.buffers.end()) {
+    if (i != strip_header->buffers.end()) {
       (*out)[*it].swap(i->second);
     } else {
       need_lookup.insert(*it);
@@ -343,8 +344,8 @@ int KeyValueStore::BufferTransaction::get_buffer_keys(
     int r = store->backend->get_values_with_header(strip_header, prefix,
                                                    need_lookup, out);
     if (r < 0) {
-      dout(10) << __func__  << " " << strip_header.cid << "/"
-               << strip_header.oid << " " << " r = " << r << dendl;
+      dout(10) << __func__  << " " << strip_header->cid << "/"
+               << strip_header->oid << " " << " r = " << r << dendl;
       return r;
     }
   }
@@ -353,78 +354,77 @@ int KeyValueStore::BufferTransaction::get_buffer_keys(
 }
 
 void KeyValueStore::BufferTransaction::set_buffer_keys(
-     StripObjectMap::StripObjectHeader &strip_header,
+     StripObjectMap::StripObjectHeaderRef strip_header,
      const string &prefix, map<string, bufferlist> &values)
 {
-  store->backend->set_keys(strip_header.header, prefix, values, t);
+  store->backend->set_keys(strip_header->header, prefix, values, t);
 
   for (map<string, bufferlist>::iterator iter = values.begin();
        iter != values.end(); ++iter) {
-    strip_header.buffers[make_pair(prefix, iter->first)].swap(iter->second);
+    strip_header->buffers[make_pair(prefix, iter->first)].swap(iter->second);
   }
 }
 
 int KeyValueStore::BufferTransaction::remove_buffer_keys(
-     StripObjectMap::StripObjectHeader &strip_header, const string &prefix,
+     StripObjectMap::StripObjectHeaderRef strip_header, const string &prefix,
      const set<string> &keys)
 {
   for (set<string>::iterator iter = keys.begin(); iter != keys.end(); ++iter) {
-    strip_header.buffers[make_pair(prefix, *iter)] = bufferlist();
+    strip_header->buffers[make_pair(prefix, *iter)] = bufferlist();
   }
 
-  return store->backend->rm_keys(strip_header.header, prefix, keys, t);
+  return store->backend->rm_keys(strip_header->header, prefix, keys, t);
 }
 
 void KeyValueStore::BufferTransaction::clear_buffer_keys(
-     StripObjectMap::StripObjectHeader &strip_header, const string &prefix)
+     StripObjectMap::StripObjectHeaderRef strip_header, const string &prefix)
 {
-  for (map<pair<string, string>, bufferlist>::iterator iter = strip_header.buffers.begin();
-       iter != strip_header.buffers.end(); ++iter) {
+  for (map<pair<string, string>, bufferlist>::iterator iter = strip_header->buffers.begin();
+       iter != strip_header->buffers.end(); ++iter) {
     if (iter->first.first == prefix)
       iter->second = bufferlist();
   }
 }
 
 int KeyValueStore::BufferTransaction::clear_buffer(
-     StripObjectMap::StripObjectHeader &strip_header)
+     StripObjectMap::StripObjectHeaderRef strip_header)
 {
-  strip_header.deleted = true;
+  strip_header->deleted = true;
 
-  return store->backend->clear(strip_header.header, t);
+  InvalidateCacheContext *c = new InvalidateCacheContext(store, strip_header->cid, strip_header->oid);
+  finishes.push_back(c);
+  return store->backend->clear(strip_header->header, t);
 }
 
 void KeyValueStore::BufferTransaction::clone_buffer(
-    StripObjectMap::StripObjectHeader &old_header,
+    StripObjectMap::StripObjectHeaderRef old_header,
     const coll_t &cid, const ghobject_t &oid)
 {
   // Remove target ahead to avoid dead lock
   strip_headers.erase(make_pair(cid, oid));
 
-  StripObjectMap::StripObjectHeader new_origin_header, new_target_header;
+  StripObjectMap::StripObjectHeaderRef new_target_header;
 
-  store->backend->clone_wrap(old_header, cid, oid, t,
-                             &new_origin_header, &new_target_header);
+  store->backend->clone_wrap(old_header, cid, oid, t, &new_target_header);
 
   // FIXME: Lacking of lock for origin header(now become parent), it will
   // cause other operation can get the origin header while submitting
   // transactions
-  strip_headers[make_pair(cid, old_header.oid)] = new_origin_header;
   strip_headers[make_pair(cid, oid)] = new_target_header;
 }
 
 void KeyValueStore::BufferTransaction::rename_buffer(
-    StripObjectMap::StripObjectHeader &old_header,
+    StripObjectMap::StripObjectHeaderRef old_header,
     const coll_t &cid, const ghobject_t &oid)
 {
-  if (store->backend->check_spos(old_header, spos))
-    return ;
-
   // FIXME: Lacking of lock for origin header, it will cause other operation
   // can get the origin header while submitting transactions
-  store->backend->rename_wrap(cid, oid, t, &old_header);
+  StripObjectMap::StripObjectHeaderRef new_header;
+  store->backend->rename_wrap(old_header, cid, oid, t, &new_header);
 
-  strip_headers.erase(make_pair(old_header.cid, old_header.oid));
-  strip_headers[make_pair(cid, oid)] = old_header;
+  InvalidateCacheContext *c = new InvalidateCacheContext(store, old_header->cid, old_header->oid);
+  finishes.push_back(c);
+  strip_headers[make_pair(cid, oid)] = new_header;
 }
 
 int KeyValueStore::BufferTransaction::submit_transaction()
@@ -433,25 +433,27 @@ int KeyValueStore::BufferTransaction::submit_transaction()
 
   for (StripHeaderMap::iterator header_iter = strip_headers.begin();
        header_iter != strip_headers.end(); ++header_iter) {
-    StripObjectMap::StripObjectHeader header = header_iter->second;
+    StripObjectMap::StripObjectHeaderRef header = header_iter->second;
 
-    if (store->backend->check_spos(header, spos))
+    if (header->deleted)
       continue;
 
-    if (header.deleted)
-      continue;
+    r = store->backend->save_strip_header(header, t);
 
-    r = store->backend->save_strip_header(header, spos, t);
     if (r < 0) {
       dout(10) << __func__ << " save strip header failed " << dendl;
       goto out;
     }
   }
 
-out:
+  r = store->backend->submit_transaction_sync(t);
+  for (list<Context*>::iterator it = finishes.begin(); it != finishes.end(); ++it) {
+    (*it)->complete(r);
+  }
 
+out:
   dout(5) << __func__ << " r = " << r << dendl;
-  return store->backend->submit_transaction(t);
+  return r;
 }
 
 // =========== KeyValueStore Intern Helper Implementation ==============
@@ -492,8 +494,7 @@ KeyValueStore::KeyValueStore(const std::string &base,
   ObjectStore(base),
   internal_name(name),
   basedir(base),
-  fsid_fd(-1), op_fd(-1), current_fd(-1),
-  kv_type(KV_TYPE_NONE),
+  fsid_fd(-1), current_fd(-1),
   backend(NULL),
   ondisk_finisher(g_ceph_context),
   lock("KeyValueStore::lock"),
@@ -505,9 +506,11 @@ KeyValueStore::KeyValueStore(const std::string &base,
         g_conf->keyvaluestore_op_threads, "keyvaluestore_op_threads"),
   op_wq(this, g_conf->keyvaluestore_op_thread_timeout,
         g_conf->keyvaluestore_op_thread_suicide_timeout, &op_tp),
-  logger(NULL),
+  perf_logger(NULL),
   m_keyvaluestore_queue_max_ops(g_conf->keyvaluestore_queue_max_ops),
   m_keyvaluestore_queue_max_bytes(g_conf->keyvaluestore_queue_max_bytes),
+  m_keyvaluestore_strip_size(g_conf->keyvaluestore_default_strip_size),
+  m_keyvaluestore_max_expected_write_size(g_conf->keyvaluestore_max_expected_write_size),
   do_update(do_update)
 {
   ostringstream oss;
@@ -518,8 +521,8 @@ KeyValueStore::KeyValueStore(const std::string &base,
   sss << basedir << "/current/commit_op_seq";
   current_op_seq_fn = sss.str();
 
-  // initialize logger
-  PerfCountersBuilder plb(g_ceph_context, internal_name, l_os_commit_lat, l_os_last);
+  // initialize perf_logger
+  PerfCountersBuilder plb(g_ceph_context, internal_name, l_os_commit_len, l_os_last);
 
   plb.add_u64(l_os_oq_max_ops, "op_queue_max_ops");
   plb.add_u64(l_os_oq_ops, "op_queue_ops");
@@ -527,21 +530,24 @@ KeyValueStore::KeyValueStore(const std::string &base,
   plb.add_u64(l_os_oq_max_bytes, "op_queue_max_bytes");
   plb.add_u64(l_os_oq_bytes, "op_queue_bytes");
   plb.add_u64_counter(l_os_bytes, "bytes");
+  plb.add_time_avg(l_os_commit_lat, "commit_latency");
   plb.add_time_avg(l_os_apply_lat, "apply_latency");
   plb.add_time_avg(l_os_queue_lat, "queue_transaction_latency_avg");
 
-  logger = plb.create_perf_counters();
+  perf_logger = plb.create_perf_counters();
 
-  g_ceph_context->get_perfcounters_collection()->add(logger);
+  g_ceph_context->get_perfcounters_collection()->add(perf_logger);
   g_ceph_context->_conf->add_observer(this);
+
+  superblock.compat_features = get_kv_initial_compat_set();
 }
 
 KeyValueStore::~KeyValueStore()
 {
   g_ceph_context->_conf->remove_observer(this);
-  g_ceph_context->get_perfcounters_collection()->remove(logger);
+  g_ceph_context->get_perfcounters_collection()->remove(perf_logger);
 
-  delete logger;
+  delete perf_logger;
 }
 
 int KeyValueStore::statfs(struct statfs *buf)
@@ -628,34 +634,26 @@ int KeyValueStore::mkfs()
     goto close_fsid_fd;
   }
 
-  if (_detect_backend()) {
-    derr << "KeyValueStore::mkfs error in _detect_backend" << dendl;
-    ret = -1;
+  // superblock
+  superblock.backend = g_conf->keyvaluestore_backend;
+  ret = write_superblock();
+  if (ret < 0) {
+    derr << "KeyValueStore::mkfs write_superblock() failed: "
+	 << cpp_strerror(ret) << dendl;
     goto close_fsid_fd;
   }
 
   {
-    KeyValueDB *store;
-    if (kv_type == KV_TYPE_LEVELDB) {
-      store = new LevelDBStore(g_ceph_context, current_fn);
-    } else {
-      derr << "KeyValueStore::mkfs error: unknown backend type" << kv_type << dendl;
+    ret = KeyValueDB::test_init(superblock.backend, current_fn.c_str());
+    if(ret < 0)
+    {
+      derr << __func__  << " failed to create backend type "
+	   << g_conf->keyvaluestore_backend << "." << dendl;
       ret = -1;
       goto close_fsid_fd;
-    }
 
-    store->init();
-    stringstream err;
-    if (store->create_and_open(err)) {
-      derr << "KeyValueStore::mkfs failed to create keyvaluestore backend: "
-           << err.str() << dendl;
-      ret = -1;
-      delete store;
-      goto close_fsid_fd;
-    } else {
-      delete store;
-      dout(1) << "keyvaluestore backend exists/created" << dendl;
     }
+    dout(1) << g_conf->keyvaluestore_backend << " backend exists/created" << dendl;
   }
 
   dout(1) << "mkfs done in " << basedir << dendl;
@@ -723,6 +721,36 @@ bool KeyValueStore::test_mount_in_use()
   return inuse;
 }
 
+int KeyValueStore::write_superblock()
+{
+  bufferlist bl;
+  ::encode(superblock, bl);
+  return safe_write_file(basedir.c_str(), "superblock",
+      bl.c_str(), bl.length());
+}
+
+int KeyValueStore::read_superblock()
+{
+  bufferptr bp(PATH_MAX);
+  int ret = safe_read_file(basedir.c_str(), "superblock",
+      bp.c_str(), bp.length());
+  if (ret < 0) {
+    if (ret == -ENOENT) {
+      // If the file doesn't exist write initial CompatSet
+      return write_superblock();
+    }
+    return ret;
+  }
+
+  bufferlist bl;
+  bl.push_back(bp);
+  bufferlist::iterator i = bl.begin();
+  ::decode(superblock, i);
+  return 0;
+}
+
+
+
 int KeyValueStore::update_version_stamp()
 {
   return write_version_stamp();
@@ -761,6 +789,7 @@ int KeyValueStore::mount()
 {
   int ret;
   char buf[PATH_MAX];
+  CompatSet supported_compat_set = get_kv_supported_compat_set();
 
   dout(5) << "basedir " << basedir << dendl;
 
@@ -817,6 +846,20 @@ int KeyValueStore::mount()
       goto close_fsid_fd;
     }
   }
+  
+  ret = read_superblock();
+  if (ret < 0) {
+    ret = -EINVAL;
+    goto close_fsid_fd;
+  }
+
+  // Check if this KeyValueStore supports all the necessary features to mount
+  if (supported_compat_set.compare(superblock.compat_features) == -1) {
+    derr << "KeyValueStore::mount : Incompatible features set "
+	   << superblock.compat_features << dendl;
+    ret = -EINVAL;
+    goto close_fsid_fd;
+  }
 
   current_fd = ::open(current_fn.c_str(), O_RDONLY);
   if (current_fd < 0) {
@@ -828,28 +871,25 @@ int KeyValueStore::mount()
 
   assert(current_fd >= 0);
 
-  if (_detect_backend()) {
-    derr << "KeyValueStore::mount error in _detect_backend" << dendl;
-    ret = -1;
-    goto close_current_fd;
-  }
-
   {
-    KeyValueDB *store;
-    if (kv_type == KV_TYPE_LEVELDB) {
-      store = new LevelDBStore(g_ceph_context, current_fn);
-    } else {
-      derr << "KeyValueStore::mount error: unknown backend type" << kv_type
-           << dendl;
+
+    KeyValueDB *store = KeyValueDB::create(g_ceph_context,
+					   superblock.backend,
+					   current_fn.c_str());
+    if(!store)
+    {
+      derr << "KeyValueStore::mount backend type "
+	   << superblock.backend << " error" << dendl;
       ret = -1;
-      goto close_current_fd;
+      goto close_fsid_fd;
+
     }
 
     store->init();
     stringstream err;
     if (store->open(err)) {
-      derr << "KeyValueStore::mount Error initializing keyvaluestore backend: "
-           << err.str() << dendl;
+      derr << "KeyValueStore::mount Error initializing keyvaluestore backend "
+           << superblock.backend << ": " << err.str() << dendl;
       ret = -1;
       delete store;
       goto close_current_fd;
@@ -865,12 +905,13 @@ int KeyValueStore::mount()
     stringstream err2;
 
     if (g_conf->keyvaluestore_debug_check_backend && !dbomap->check(err2)) {
-      derr << err2.str() << dendl;;
+      derr << err2.str() << dendl;
       delete dbomap;
       ret = -EINVAL;
       goto close_current_fd;
     }
 
+    default_strip_size = m_keyvaluestore_strip_size;
     backend.reset(dbomap);
   }
 
@@ -903,10 +944,6 @@ int KeyValueStore::umount()
     VOID_TEMP_FAILURE_RETRY(::close(fsid_fd));
     fsid_fd = -1;
   }
-  if (op_fd >= 0) {
-    VOID_TEMP_FAILURE_RETRY(::close(op_fd));
-    op_fd = -1;
-  }
   if (current_fd >= 0) {
     VOID_TEMP_FAILURE_RETRY(::close(current_fd));
     current_fd = -1;
@@ -916,21 +953,6 @@ int KeyValueStore::umount()
 
   // nothing
   return 0;
-}
-
-int KeyValueStore::get_max_object_name_length()
-{
-  lock.Lock();
-  int ret = pathconf(basedir.c_str(), _PC_NAME_MAX);
-  if (ret < 0) {
-    int err = errno;
-    lock.Unlock();
-    if (err == 0)
-      return -EDOM;
-    return -err;
-  }
-  lock.Unlock();
-  return ret;
 }
 
 int KeyValueStore::queue_transactions(Sequencer *posr, list<Transaction*> &tls,
@@ -960,13 +982,8 @@ int KeyValueStore::queue_transactions(Sequencer *posr, list<Transaction*> &tls,
 
   Op *o = build_op(tls, ondisk, onreadable, onreadable_sync, osd_op);
   op_queue_reserve_throttle(o, handle);
-  uint64_t op = submit_manager.op_submit_start();
-  o->op = op;
-  dout(5) << "queue_transactions (trailing journal) " << op << " "
-          << tls <<dendl;
+  dout(5) << "queue_transactions (trailing journal) " << " " << tls <<dendl;
   queue_op(osr, o);
-
-  submit_manager.op_submit_finish(op);
 
   return 0;
 }
@@ -1006,8 +1023,8 @@ void KeyValueStore::queue_op(OpSequencer *osr, Op *o)
 
   osr->queue(o);
 
-  logger->inc(l_os_ops);
-  logger->inc(l_os_bytes, o->bytes);
+  perf_logger->inc(l_os_ops);
+  perf_logger->inc(l_os_bytes, o->bytes);
 
   dout(5) << "queue_op " << o << " seq " << o->op << " " << *osr << " "
           << o->bytes << " bytes" << "   (queue has " << op_queue_len
@@ -1020,8 +1037,8 @@ void KeyValueStore::op_queue_reserve_throttle(Op *o, ThreadPool::TPHandle *handl
   uint64_t max_ops = m_keyvaluestore_queue_max_ops;
   uint64_t max_bytes = m_keyvaluestore_queue_max_bytes;
 
-  logger->set(l_os_oq_max_ops, max_ops);
-  logger->set(l_os_oq_max_bytes, max_bytes);
+  perf_logger->set(l_os_oq_max_ops, max_ops);
+  perf_logger->set(l_os_oq_max_bytes, max_bytes);
 
   utime_t start = ceph_clock_now(g_ceph_context);
   {
@@ -1043,10 +1060,10 @@ void KeyValueStore::op_queue_reserve_throttle(Op *o, ThreadPool::TPHandle *handl
     op_queue_bytes += o->bytes;
   }
   utime_t end = ceph_clock_now(g_ceph_context);
-  logger->tinc(l_os_queue_lat, end - start);
+  perf_logger->tinc(l_os_queue_lat, end - start);
 
-  logger->set(l_os_oq_ops, op_queue_len);
-  logger->set(l_os_oq_bytes, op_queue_bytes);
+  perf_logger->set(l_os_oq_ops, op_queue_len);
+  perf_logger->set(l_os_oq_bytes, op_queue_bytes);
 }
 
 void KeyValueStore::op_queue_release_throttle(Op *o)
@@ -1058,8 +1075,8 @@ void KeyValueStore::op_queue_release_throttle(Op *o)
     op_throttle_cond.Signal();
   }
 
-  logger->set(l_os_oq_ops, op_queue_len);
-  logger->set(l_os_oq_bytes, op_queue_bytes);
+  perf_logger->set(l_os_oq_ops, op_queue_len);
+  perf_logger->set(l_os_oq_bytes, op_queue_bytes);
 }
 
 void KeyValueStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
@@ -1085,7 +1102,8 @@ void KeyValueStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
 
 void KeyValueStore::_finish_op(OpSequencer *osr)
 {
-  Op *o = osr->dequeue();
+  list<Context*> to_queue;
+  Op *o = osr->dequeue(&to_queue);
 
   dout(10) << "_finish_op " << o << " seq " << o->op << " " << *osr << "/" << osr->parent << dendl;
   osr->apply_lock.Unlock();  // locked in _do_op
@@ -1093,12 +1111,14 @@ void KeyValueStore::_finish_op(OpSequencer *osr)
 
   utime_t lat = ceph_clock_now(g_ceph_context);
   lat -= o->start;
-  logger->tinc(l_os_apply_lat, lat);
+  perf_logger->tinc(l_os_commit_lat, lat);
+  perf_logger->tinc(l_os_apply_lat, lat);
 
   if (o->onreadable_sync) {
     o->onreadable_sync->complete(0);
   }
   op_finisher.queue(o->onreadable);
+  op_finisher.queue(to_queue);
   delete o;
 }
 
@@ -1123,13 +1143,12 @@ int KeyValueStore::_do_transactions(list<Transaction*> &tls, uint64_t op_seq,
   }
 
   int trans_num = 0;
-  SequencerPosition spos(op_seq, trans_num, 0);
-  BufferTransaction bt(this, spos);
+  BufferTransaction bt(this);
 
   for (list<Transaction*>::iterator p = tls.begin();
        p != tls.end();
        ++p, trans_num++) {
-    r = _do_transaction(**p, bt, spos, handle);
+    r = _do_transaction(**p, bt, handle);
     if (r < 0)
       break;
     if (handle)
@@ -1146,18 +1165,18 @@ int KeyValueStore::_do_transactions(list<Transaction*> &tls, uint64_t op_seq,
 
 unsigned KeyValueStore::_do_transaction(Transaction& transaction,
                                         BufferTransaction &t,
-                                        SequencerPosition& spos,
                                         ThreadPool::TPHandle *handle)
 {
   dout(10) << "_do_transaction on " << &transaction << dendl;
 
   Transaction::iterator i = transaction.begin();
+  uint64_t op_num = 0;
 
   while (i.have_op()) {
     if (handle)
       handle->reset_tp_timeout();
 
-    int op = i.get_op();
+    int op = i.decode_op();
     int r = 0;
 
     switch (op) {
@@ -1166,69 +1185,69 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
 
     case Transaction::OP_TOUCH:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _touch(cid, oid, t);
       }
       break;
 
     case Transaction::OP_WRITE:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        uint64_t off = i.get_length();
-        uint64_t len = i.get_length();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        uint64_t off = i.decode_length();
+        uint64_t len = i.decode_length();
         bool replica = i.get_replica();
         bufferlist bl;
-        i.get_bl(bl);
+        i.decode_bl(bl);
         r = _write(cid, oid, off, len, bl, t, replica);
       }
       break;
 
     case Transaction::OP_ZERO:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        uint64_t off = i.get_length();
-        uint64_t len = i.get_length();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        uint64_t off = i.decode_length();
+        uint64_t len = i.decode_length();
         r = _zero(cid, oid, off, len, t);
       }
       break;
 
     case Transaction::OP_TRIMCACHE:
       {
-        i.get_cid();
-        i.get_oid();
-        i.get_length();
-        i.get_length();
+        i.decode_cid();
+        i.decode_oid();
+        i.decode_length();
+        i.decode_length();
         // deprecated, no-op
       }
       break;
 
     case Transaction::OP_TRUNCATE:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        uint64_t off = i.get_length();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        uint64_t off = i.decode_length();
         r = _truncate(cid, oid, off, t);
       }
       break;
 
     case Transaction::OP_REMOVE:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _remove(cid, oid, t);
       }
       break;
 
     case Transaction::OP_SETATTR:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        string name = i.get_attrname();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        string name = i.decode_attrname();
         bufferlist bl;
-        i.get_bl(bl);
+        i.decode_bl(bl);
         map<string, bufferptr> to_set;
         to_set[name] = bufferptr(bl.c_str(), bl.length());
         r = _setattrs(cid, oid, to_set, t);
@@ -1240,10 +1259,10 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
 
     case Transaction::OP_SETATTRS:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         map<string, bufferptr> aset;
-        i.get_attrset(aset);
+        i.decode_attrset(aset);
         r = _setattrs(cid, oid, aset, t);
         if (r == -ENOSPC)
           dout(0) << " ENOSPC on setxattrs on " << cid << "/" << oid << dendl;
@@ -1252,80 +1271,80 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
 
     case Transaction::OP_RMATTR:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        string name = i.get_attrname();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        string name = i.decode_attrname();
         r = _rmattr(cid, oid, name.c_str(), t);
       }
       break;
 
     case Transaction::OP_RMATTRS:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _rmattrs(cid, oid, t);
       }
       break;
 
     case Transaction::OP_CLONE:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        ghobject_t noid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        ghobject_t noid = i.decode_oid();
         r = _clone(cid, oid, noid, t);
       }
       break;
 
     case Transaction::OP_CLONERANGE:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        ghobject_t noid = i.get_oid();
-        uint64_t off = i.get_length();
-        uint64_t len = i.get_length();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        ghobject_t noid = i.decode_oid();
+        uint64_t off = i.decode_length();
+        uint64_t len = i.decode_length();
         r = _clone_range(cid, oid, noid, off, len, off, t);
       }
       break;
 
     case Transaction::OP_CLONERANGE2:
       {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
-        ghobject_t noid = i.get_oid();
-        uint64_t srcoff = i.get_length();
-        uint64_t len = i.get_length();
-        uint64_t dstoff = i.get_length();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
+        ghobject_t noid = i.decode_oid();
+        uint64_t srcoff = i.decode_length();
+        uint64_t len = i.decode_length();
+        uint64_t dstoff = i.decode_length();
         r = _clone_range(cid, oid, noid, srcoff, len, dstoff, t);
       }
       break;
 
     case Transaction::OP_MKCOLL:
       {
-        coll_t cid = i.get_cid();
+        coll_t cid = i.decode_cid();
         r = _create_collection(cid, t);
       }
       break;
 
     case Transaction::OP_RMCOLL:
       {
-        coll_t cid = i.get_cid();
+        coll_t cid = i.decode_cid();
         r = _destroy_collection(cid, t);
       }
       break;
 
     case Transaction::OP_COLL_ADD:
       {
-        coll_t ncid = i.get_cid();
-        coll_t ocid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t ncid = i.decode_cid();
+        coll_t ocid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _collection_add(ncid, ocid, oid, t);
       }
       break;
 
     case Transaction::OP_COLL_REMOVE:
        {
-        coll_t cid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t cid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _remove(cid, oid, t);
        }
       break;
@@ -1333,37 +1352,37 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
     case Transaction::OP_COLL_MOVE:
       {
         // WARNING: this is deprecated and buggy; only here to replay old journals.
-        coll_t ocid = i.get_cid();
-        coll_t ncid = i.get_cid();
-        ghobject_t oid = i.get_oid();
+        coll_t ocid = i.decode_cid();
+        coll_t ncid = i.decode_cid();
+        ghobject_t oid = i.decode_oid();
         r = _collection_move_rename(ocid, oid, ncid, oid, t);
       }
       break;
 
     case Transaction::OP_COLL_MOVE_RENAME:
       {
-        coll_t oldcid = i.get_cid();
-        ghobject_t oldoid = i.get_oid();
-        coll_t newcid = i.get_cid();
-        ghobject_t newoid = i.get_oid();
+        coll_t oldcid = i.decode_cid();
+        ghobject_t oldoid = i.decode_oid();
+        coll_t newcid = i.decode_cid();
+        ghobject_t newoid = i.decode_oid();
         r = _collection_move_rename(oldcid, oldoid, newcid, newoid, t);
       }
       break;
 
     case Transaction::OP_COLL_SETATTR:
       {
-        coll_t cid = i.get_cid();
-        string name = i.get_attrname();
+        coll_t cid = i.decode_cid();
+        string name = i.decode_attrname();
         bufferlist bl;
-        i.get_bl(bl);
+        i.decode_bl(bl);
         r = _collection_setattr(cid, name.c_str(), bl.c_str(), bl.length(), t);
       }
       break;
 
     case Transaction::OP_COLL_RMATTR:
       {
-        coll_t cid = i.get_cid();
-        string name = i.get_attrname();
+        coll_t cid = i.decode_cid();
+        string name = i.decode_attrname();
         r = _collection_rmattr(cid, name.c_str(), t);
       }
       break;
@@ -1376,77 +1395,84 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
 
     case Transaction::OP_COLL_RENAME:
       {
-        coll_t cid(i.get_cid());
-        coll_t ncid(i.get_cid());
+        coll_t cid(i.decode_cid());
+        coll_t ncid(i.decode_cid());
         r = _collection_rename(cid, ncid, t);
       }
       break;
 
     case Transaction::OP_OMAP_CLEAR:
       {
-        coll_t cid(i.get_cid());
-        ghobject_t oid = i.get_oid();
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
         r = _omap_clear(cid, oid, t);
       }
       break;
     case Transaction::OP_OMAP_SETKEYS:
       {
-        coll_t cid(i.get_cid());
-        ghobject_t oid = i.get_oid();
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
         map<string, bufferlist> aset;
-        i.get_attrset(aset);
+        i.decode_attrset(aset);
         r = _omap_setkeys(cid, oid, aset, t);
       }
       break;
     case Transaction::OP_OMAP_RMKEYS:
       {
-        coll_t cid(i.get_cid());
-        ghobject_t oid = i.get_oid();
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
         set<string> keys;
-        i.get_keyset(keys);
+        i.decode_keyset(keys);
         r = _omap_rmkeys(cid, oid, keys, t);
       }
       break;
     case Transaction::OP_OMAP_RMKEYRANGE:
       {
-        coll_t cid(i.get_cid());
-        ghobject_t oid = i.get_oid();
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
         string first, last;
-        first = i.get_key();
-        last = i.get_key();
+        first = i.decode_key();
+        last = i.decode_key();
         r = _omap_rmkeyrange(cid, oid, first, last, t);
       }
       break;
     case Transaction::OP_OMAP_SETHEADER:
       {
-        coll_t cid(i.get_cid());
-        ghobject_t oid = i.get_oid();
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
         bufferlist bl;
-        i.get_bl(bl);
+        i.decode_bl(bl);
         r = _omap_setheader(cid, oid, bl, t);
       }
       break;
     case Transaction::OP_SPLIT_COLLECTION:
       {
-        coll_t cid(i.get_cid());
-        uint32_t bits(i.get_u32());
-        uint32_t rem(i.get_u32());
-        coll_t dest(i.get_cid());
+        coll_t cid(i.decode_cid());
+        uint32_t bits(i.decode_u32());
+        uint32_t rem(i.decode_u32());
+        coll_t dest(i.decode_cid());
         r = _split_collection_create(cid, bits, rem, dest, t);
       }
       break;
     case Transaction::OP_SPLIT_COLLECTION2:
       {
-        coll_t cid(i.get_cid());
-        uint32_t bits(i.get_u32());
-        uint32_t rem(i.get_u32());
-        coll_t dest(i.get_cid());
+        coll_t cid(i.decode_cid());
+        uint32_t bits(i.decode_u32());
+        uint32_t rem(i.decode_u32());
+        coll_t dest(i.decode_cid());
         r = _split_collection(cid, bits, rem, dest, t);
       }
       break;
 
     case Transaction::OP_SETALLOCHINT:
-      // TODO: can kvstore make use of the hint?
+      {
+        coll_t cid(i.decode_cid());
+        ghobject_t oid = i.decode_oid();
+        uint64_t expected_object_size = i.decode_length();
+        uint64_t expected_write_size = i.decode_length();
+        r = _set_alloc_hint(cid, oid, expected_object_size,
+                            expected_write_size, t);
+      }
       break;
 
     default:
@@ -1484,8 +1510,7 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
         }
 
         dout(0) << " error " << cpp_strerror(r) << " not handled on operation "
-                << op << " (" << spos << ", or op " << spos.op
-                << ", counting from 0)" << dendl;
+                << op << " op " << op_num << ", counting from 0)" << dendl;
         dout(0) << msg << dendl;
         dout(0) << " transaction dump:\n";
         JSONFormatter f(true);
@@ -1502,7 +1527,7 @@ unsigned KeyValueStore::_do_transaction(Transaction& transaction,
       }
     }
 
-    spos.op++;
+    op_num++;
   }
 
   return 0;  // FIXME count errors
@@ -1517,9 +1542,9 @@ bool KeyValueStore::exists(coll_t cid, const ghobject_t& oid)
   dout(10) << __func__ << "collection: " << cid << " object: " << oid
            << dendl;
   int r;
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
 
-  r = backend->lookup_strip_header(cid, oid, header);
+  r = backend->lookup_strip_header(cid, oid, &header);
   if (r < 0) {
     return false;
   }
@@ -1532,42 +1557,42 @@ int KeyValueStore::stat(coll_t cid, const ghobject_t& oid,
 {
   dout(10) << "stat " << cid << "/" << oid << dendl;
 
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
 
-  int r = backend->lookup_strip_header(cid, oid, header);
+  int r = backend->lookup_strip_header(cid, oid, &header);
   if (r < 0) {
     dout(10) << "stat " << cid << "/" << oid << "=" << r << dendl;
     return -ENOENT;
   }
 
-  st->st_blocks = header.max_size / header.strip_size;
-  if (header.max_size % header.strip_size)
+  st->st_blocks = header->max_size / header->strip_size;
+  if (header->max_size % header->strip_size)
     st->st_blocks++;
   st->st_nlink = 1;
-  st->st_size = header.max_size;
-  st->st_blksize = header.strip_size;
+  st->st_size = header->max_size;
+  st->st_blksize = header->strip_size;
 
   return r;
 }
 
-int KeyValueStore::_generic_read(StripObjectMap::StripObjectHeader &header,
+int KeyValueStore::_generic_read(StripObjectMap::StripObjectHeaderRef header,
                                  uint64_t offset, size_t len, bufferlist& bl,
                                  bool allow_eio, BufferTransaction *bt)
 {
-  if (header.max_size < offset) {
-    dout(10) << __func__ << " " << header.cid << "/" << header.oid << ")"
+  if (header->max_size < offset) {
+    dout(10) << __func__ << " " << header->cid << "/" << header->oid << ")"
              << " offset exceed the length of bl"<< dendl;
     return 0;
   }
 
   if (len == 0)
-    len = header.max_size - offset;
+    len = header->max_size - offset;
 
-  if (offset + len > header.max_size)
-    len = header.max_size - offset;
+  if (offset + len > header->max_size)
+    len = header->max_size - offset;
 
   vector<StripObjectMap::StripExtent> extents;
-  StripObjectMap::file_to_extents(offset, len, header.strip_size,
+  StripObjectMap::file_to_extents(offset, len, header->strip_size,
                                   extents);
   map<string, bufferlist> out;
   set<string> keys;
@@ -1577,23 +1602,23 @@ int KeyValueStore::_generic_read(StripObjectMap::StripObjectHeader &header,
     bufferlist old;
     string key = strip_object_key(iter->no);
 
-    if (bt && header.buffers.count(make_pair(OBJECT_STRIP_PREFIX, key))) {
+    if (bt && header->buffers.count(make_pair(OBJECT_STRIP_PREFIX, key))) {
       // use strip_header buffer
-      assert(header.bits[iter->no]);
-      out[key] = header.buffers[make_pair(OBJECT_STRIP_PREFIX, key)];
-    } else if (header.bits[iter->no]) {
+      assert(header->bits[iter->no]);
+      out[key] = header->buffers[make_pair(OBJECT_STRIP_PREFIX, key)];
+    } else if (header->bits[iter->no]) {
       keys.insert(key);
     }
   }
 
   int r = backend->get_values_with_header(header, OBJECT_STRIP_PREFIX, keys, &out);
   if (r < 0) {
-    dout(10) << __func__ << " " << header.cid << "/" << header.oid << " "
+    dout(10) << __func__ << " " << header->cid << "/" << header->oid << " "
              << offset << "~" << len << " = " << r << dendl;
     return r;
   } else if (out.size() != keys.size()) {
     dout(0) << __func__ << " broken header or missing data in backend "
-            << header.cid << "/" << header.oid << " " << offset << "~"
+            << header->cid << "/" << header->oid << " " << offset << "~"
             << len << " = " << r << dendl;
     return -EBADF;
   }
@@ -1602,8 +1627,8 @@ int KeyValueStore::_generic_read(StripObjectMap::StripObjectHeader &header,
        iter != extents.end(); ++iter) {
     string key = strip_object_key(iter->no);
 
-    if (header.bits[iter->no]) {
-      if (iter->len == header.strip_size) {
+    if (header->bits[iter->no]) {
+      if (iter->len == header->strip_size) {
         bl.claim_append(out[key]);
       } else {
         out[key].copy(iter->offset, iter->len, bl);
@@ -1613,7 +1638,7 @@ int KeyValueStore::_generic_read(StripObjectMap::StripObjectHeader &header,
     }
   }
 
-  dout(10) << __func__ << " " << header.cid << "/" << header.oid << " "
+  dout(10) << __func__ << " " << header->cid << "/" << header->oid << " "
            << offset << "~" << bl.length() << "/" << len << " r = " << r
            << dendl;
 
@@ -1627,9 +1652,9 @@ int KeyValueStore::read(coll_t cid, const ghobject_t& oid, uint64_t offset,
   dout(15) << __func__ << " " << cid << "/" << oid << " " << offset << "~"
            << len << dendl;
 
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
 
-  int r = backend->lookup_strip_header(cid, oid, header);
+  int r = backend->lookup_strip_header(cid, oid, &header);
 
   if (r < 0) {
     dout(10) << __func__ << " " << cid << "/" << oid << " " << offset << "~"
@@ -1646,9 +1671,9 @@ int KeyValueStore::fiemap(coll_t cid, const ghobject_t& oid,
   dout(10) << __func__ << " " << cid << " " << oid << " " << offset << "~"
            << len << dendl;
   int r;
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
 
-  r = backend->lookup_strip_header(cid, oid, header);
+  r = backend->lookup_strip_header(cid, oid, &header);
   if (r < 0) {
     dout(10) << "fiemap " << cid << "/" << oid << " " << offset << "~" << len
              << " failed to get header: r = " << r << dendl;
@@ -1656,13 +1681,14 @@ int KeyValueStore::fiemap(coll_t cid, const ghobject_t& oid,
   }
 
   vector<StripObjectMap::StripExtent> extents;
-  StripObjectMap::file_to_extents(offset, len, header.strip_size,
+  StripObjectMap::file_to_extents(offset, len, header->strip_size,
                                   extents);
 
   map<uint64_t, uint64_t> m;
   for (vector<StripObjectMap::StripExtent>::iterator iter = extents.begin();
        iter != extents.end(); ++iter) {
-    m[iter->offset] = iter->len;
+    uint64_t off = iter->no * header->strip_size + iter->offset;
+    m[off] = iter->len;
   }
   ::encode(m, bl);
   return 0;
@@ -1674,7 +1700,7 @@ int KeyValueStore::_remove(coll_t cid, const ghobject_t& oid,
   dout(15) << __func__ << " " << cid << "/" << oid << dendl;
 
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, false);
   if (r < 0) {
@@ -1683,7 +1709,9 @@ int KeyValueStore::_remove(coll_t cid, const ghobject_t& oid,
     return r;
   }
 
-  r = t.clear_buffer(*header);
+  header->max_size = 0;
+  header->bits.clear();
+  r = t.clear_buffer(header);
 
   dout(10) << __func__ << " " << cid << "/" << oid << " = " << r << dendl;
   return r;
@@ -1696,7 +1724,7 @@ int KeyValueStore::_truncate(coll_t cid, const ghobject_t& oid, uint64_t size,
            << dendl;
 
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, false);
   if (r < 0) {
@@ -1722,7 +1750,7 @@ int KeyValueStore::_truncate(coll_t cid, const ghobject_t& oid, uint64_t size,
       string key = strip_object_key(iter->no);
 
       lookup_keys.insert(key);
-      r = t.get_buffer_keys(*header, OBJECT_STRIP_PREFIX,
+      r = t.get_buffer_keys(header, OBJECT_STRIP_PREFIX,
                             lookup_keys, &values);
       if (r < 0) {
         dout(10) << __func__ << " " << cid << "/" << oid << " "
@@ -1740,7 +1768,7 @@ int KeyValueStore::_truncate(coll_t cid, const ghobject_t& oid, uint64_t size,
       assert(value.length() == header->strip_size);
       value.swap(values[key]);
 
-      t.set_buffer_keys(*header, OBJECT_STRIP_PREFIX, values);
+      t.set_buffer_keys(header, OBJECT_STRIP_PREFIX, values);
       ++iter;
     }
 
@@ -1751,7 +1779,7 @@ int KeyValueStore::_truncate(coll_t cid, const ghobject_t& oid, uint64_t size,
         header->bits[iter->no] = 0;
       }
     }
-    r = t.remove_buffer_keys(*header, OBJECT_STRIP_PREFIX, keys);
+    r = t.remove_buffer_keys(header, OBJECT_STRIP_PREFIX, keys);
     if (r < 0) {
       dout(10) << __func__ << " " << cid << "/" << oid << " "
                << size << " = " << r << dendl;
@@ -1773,7 +1801,7 @@ int KeyValueStore::_touch(coll_t cid, const ghobject_t& oid,
   dout(15) << __func__ << " " << cid << "/" << oid << dendl;
 
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, true);
   if (r < 0) {
@@ -1787,7 +1815,7 @@ int KeyValueStore::_touch(coll_t cid, const ghobject_t& oid,
   return r;
 }
 
-int KeyValueStore::_generic_write(StripObjectMap::StripObjectHeader &header,
+int KeyValueStore::_generic_write(StripObjectMap::StripObjectHeaderRef header,
                                   uint64_t offset, size_t len,
                                   const bufferlist& bl, BufferTransaction &t,
                                   bool replica)
@@ -1795,34 +1823,34 @@ int KeyValueStore::_generic_write(StripObjectMap::StripObjectHeader &header,
   if (len > bl.length())
     len = bl.length();
 
-  if (len + offset > header.max_size) {
-    header.max_size = len + offset;
-    header.bits.resize(header.max_size/header.strip_size+1);
+  if (len + offset > header->max_size) {
+    header->max_size = len + offset;
+    header->bits.resize(header->max_size/header->strip_size+1);
   }
 
   vector<StripObjectMap::StripExtent> extents;
-  StripObjectMap::file_to_extents(offset, len, header.strip_size,
+  StripObjectMap::file_to_extents(offset, len, header->strip_size,
                                   extents);
 
   map<string, bufferlist> out;
   set<string> keys;
   for (vector<StripObjectMap::StripExtent>::iterator iter = extents.begin();
        iter != extents.end(); ++iter) {
-    if (header.bits[iter->no] && !(iter->offset == 0 &&
-                                   iter->len == header.strip_size))
+    if (header->bits[iter->no] && !(iter->offset == 0 &&
+                                   iter->len == header->strip_size))
       keys.insert(strip_object_key(iter->no));
   }
 
   int r = t.get_buffer_keys(header, OBJECT_STRIP_PREFIX, keys, &out);
   if (r < 0) {
-    dout(10) << __func__ << " failed to get value " << header.cid << "/"
-              << header.oid << " " << offset << "~" << len << " = " << r
+    dout(10) << __func__ << " failed to get value " << header->cid << "/"
+              << header->oid << " " << offset << "~" << len << " = " << r
               << dendl;
     return r;
   } else if (keys.size() != out.size()) {
     // Error on header.bits or the corresponding key/value pair is missing
     dout(0) << __func__ << " broken header or missing data in backend "
-            << header.cid << "/" << header.oid << " " << offset << "~"
+            << header->cid << "/" << header->oid << " " << offset << "~"
             << len << " = " << r << dendl;
     return -EBADF;
   }
@@ -1833,19 +1861,19 @@ int KeyValueStore::_generic_write(StripObjectMap::StripObjectHeader &header,
        iter != extents.end(); ++iter) {
     bufferlist value;
     string key = strip_object_key(iter->no);
-    if (header.bits[iter->no]) {
-      if (iter->offset == 0 && iter->len == header.strip_size) {
+    if (header->bits[iter->no]) {
+      if (iter->offset == 0 && iter->len == header->strip_size) {
         bl.copy(bl_offset, iter->len, value);
         bl_offset += iter->len;
       } else {
-        assert(out[key].length() == header.strip_size);
+        assert(out[key].length() == header->strip_size);
 
         out[key].copy(0, iter->offset, value);
         bl.copy(bl_offset, iter->len, value);
         bl_offset += iter->len;
 
-        if (value.length() != header.strip_size)
-          out[key].copy(value.length(), header.strip_size-value.length(),
+        if (value.length() != header->strip_size)
+          out[key].copy(value.length(), header->strip_size-value.length(),
                         value);
       }
     } else {
@@ -1854,18 +1882,18 @@ int KeyValueStore::_generic_write(StripObjectMap::StripObjectHeader &header,
       bl.copy(bl_offset, iter->len, value);
       bl_offset += iter->len;
 
-      if (value.length() < header.strip_size)
-        value.append_zero(header.strip_size-value.length());
+      if (value.length() < header->strip_size)
+        value.append_zero(header->strip_size-value.length());
 
-      header.bits[iter->no] = 1;
+      header->bits[iter->no] = 1;
     }
-    assert(value.length() == header.strip_size);
+    assert(value.length() == header->strip_size);
     values[key].swap(value);
   }
   assert(bl_offset == len);
 
   t.set_buffer_keys(header, OBJECT_STRIP_PREFIX, values);
-  dout(10) << __func__ << " " << header.cid << "/" << header.oid << " "
+  dout(10) << __func__ << " " << header->cid << "/" << header->oid << " "
            << offset << "~" << len << " = " << r << dendl;
 
   return r;
@@ -1879,7 +1907,7 @@ int KeyValueStore::_write(coll_t cid, const ghobject_t& oid,
            << len << dendl;
 
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, true);
   if (r < 0) {
@@ -1888,7 +1916,7 @@ int KeyValueStore::_write(coll_t cid, const ghobject_t& oid,
     return r;
   }
 
-  return _generic_write(*header, offset, len, bl, t, replica);
+  return _generic_write(header, offset, len, bl, t, replica);
 }
 
 int KeyValueStore::_zero(coll_t cid, const ghobject_t& oid, uint64_t offset,
@@ -1917,7 +1945,7 @@ int KeyValueStore::_clone(coll_t cid, const ghobject_t& oldoid,
     return 0;
 
   int r;
-  StripObjectMap::StripObjectHeader *old_header;
+  StripObjectMap::StripObjectHeaderRef old_header;
 
   r = t.lookup_cached_header(cid, oldoid, &old_header, false);
   if (r < 0) {
@@ -1926,7 +1954,7 @@ int KeyValueStore::_clone(coll_t cid, const ghobject_t& oldoid,
     return r;
   }
 
-  t.clone_buffer(*old_header, cid, newoid);
+  t.clone_buffer(old_header, cid, newoid);
 
   dout(10) << __func__ << " " << cid << "/" << oldoid << " -> " << cid << "/"
            << newoid << " = " << r << dendl;
@@ -1945,7 +1973,7 @@ int KeyValueStore::_clone_range(coll_t cid, const ghobject_t& oldoid,
   int r;
   bufferlist bl;
 
-  StripObjectMap::StripObjectHeader *old_header, *new_header;
+  StripObjectMap::StripObjectHeaderRef old_header, new_header;
 
   r = t.lookup_cached_header(cid, oldoid, &old_header, false);
   if (r < 0) {
@@ -1963,11 +1991,11 @@ int KeyValueStore::_clone_range(coll_t cid, const ghobject_t& oldoid,
     return r;
   }
 
-  r = _generic_read(*old_header, srcoff, len, bl, &t);
+  r = _generic_read(old_header, srcoff, len, bl, &t);
   if (r < 0)
     goto out;
 
-  r = _generic_write(*new_header, dstoff, len, bl, t);
+  r = _generic_write(new_header, dstoff, len, bl, t);
 
  out:
   dout(10) << __func__ << " " << cid << "/" << oldoid << " -> " << cid << "/"
@@ -1987,9 +2015,17 @@ int KeyValueStore::getattr(coll_t cid, const ghobject_t& oid, const char *name,
   int r;
   map<string, bufferlist> got;
   set<string> to_get;
+  StripObjectMap::StripObjectHeaderRef header;
 
   to_get.insert(string(name));
-  r = backend->get_values(cid, oid, OBJECT_XATTR, to_get, &got);
+
+  r = backend->lookup_strip_header(cid, oid, &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
+
+  r = backend->get_values_with_header(header, OBJECT_XATTR, to_get, &got);
   if (r < 0 && r != -ENOENT) {
     dout(10) << __func__ << " get_xattrs err r =" << r << dendl;
     goto out;
@@ -2009,7 +2045,7 @@ int KeyValueStore::getattr(coll_t cid, const ghobject_t& oid, const char *name,
 }
 
 int KeyValueStore::getattrs(coll_t cid, const ghobject_t& oid,
-                           map<string,bufferptr>& aset, bool user_only)
+                           map<string,bufferptr>& aset)
 {
   int r;
   map<string, bufferlist> attr_aset;
@@ -2026,15 +2062,7 @@ int KeyValueStore::getattrs(coll_t cid, const ghobject_t& oid,
   for (map<string, bufferlist>::iterator i = attr_aset.begin();
        i != attr_aset.end(); ++i) {
     string key;
-    if (user_only) {
-      if (i->first[0] != '_')
-        continue;
-      if (i->first == "_")
-        continue;
-      key = i->first.substr(1, i->first.size());
-    } else {
-      key = i->first;
-    }
+    key = i->first;
     aset.insert(make_pair(key,
                 bufferptr(i->second.c_str(), i->second.length())));
   }
@@ -2053,7 +2081,7 @@ int KeyValueStore::_setattrs(coll_t cid, const ghobject_t& oid,
 
   int r;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
   map<string, bufferlist> attrs;
 
   r = t.lookup_cached_header(cid, oid, &header, false);
@@ -2065,7 +2093,7 @@ int KeyValueStore::_setattrs(coll_t cid, const ghobject_t& oid,
     attrs[it->first].push_back(it->second);
   }
 
-  t.set_buffer_keys(*header, OBJECT_XATTR, attrs);
+  t.set_buffer_keys(header, OBJECT_XATTR, attrs);
 
 out:
   dout(10) << __func__ << " " << cid << "/" << oid << " = " << r << dendl;
@@ -2081,7 +2109,7 @@ int KeyValueStore::_rmattr(coll_t cid, const ghobject_t& oid, const char *name,
 
   int r;
   set<string> to_remove;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, false);
   if (r < 0) {
@@ -2091,7 +2119,7 @@ int KeyValueStore::_rmattr(coll_t cid, const ghobject_t& oid, const char *name,
   }
 
   to_remove.insert(string(name));
-  r = t.remove_buffer_keys(*header, OBJECT_XATTR, to_remove);
+  r = t.remove_buffer_keys(header, OBJECT_XATTR, to_remove);
 
   dout(10) << __func__ << " " << cid << "/" << oid << " '" << name << "' = "
            << r << dendl;
@@ -2106,7 +2134,7 @@ int KeyValueStore::_rmattrs(coll_t cid, const ghobject_t& oid,
   int r;
   set<string> attrs;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(cid, oid, &header, false);
   if (r < 0) {
@@ -2115,14 +2143,14 @@ int KeyValueStore::_rmattrs(coll_t cid, const ghobject_t& oid,
     return r;
   }
 
-  r = backend->get_keys_with_header(*header, OBJECT_XATTR, &attrs);
+  r = backend->get_keys_with_header(header, OBJECT_XATTR, &attrs);
   if (r < 0 && r != -ENOENT) {
     dout(10) << __func__ << " could not get attrs r = " << r << dendl;
     return r;
   }
 
-  r = t.remove_buffer_keys(*header, OBJECT_XATTR, attrs);
-  t.clear_buffer_keys(*header, OBJECT_XATTR);
+  r = t.remove_buffer_keys(header, OBJECT_XATTR, attrs);
+  t.clear_buffer_keys(header, OBJECT_XATTR);
 
   dout(10) << __func__ <<  " " << cid << "/" << oid << " = " << r << dendl;
   return r;
@@ -2165,10 +2193,18 @@ int KeyValueStore::collection_getattr(coll_t c, const char *name,
 
   set<string> keys;
   map<string, bufferlist> out;
+  StripObjectMap::StripObjectHeaderRef header;
+
   keys.insert(string(name));
 
-  int r = backend->get_values(get_coll_for_coll(), make_ghobject_for_coll(c),
-                              COLLECTION_ATTR, keys, &out);
+  int r = backend->lookup_strip_header(get_coll_for_coll(),
+                                       make_ghobject_for_coll(c), &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
+
+  r = backend->get_values_with_header(header, COLLECTION_ATTR, keys, &out);
   if (r < 0) {
     dout(10) << __func__ << " could not get key" << string(name) << dendl;
     r = -EINVAL;
@@ -2189,14 +2225,21 @@ int KeyValueStore::collection_getattrs(coll_t cid,
 
   map<string, bufferlist> out;
   set<string> keys;
+  StripObjectMap::StripObjectHeaderRef header;
 
   for (map<string, bufferptr>::iterator it = aset.begin();
        it != aset.end(); ++it) {
       keys.insert(it->first);
   }
 
-  int r = backend->get_values(get_coll_for_coll(), make_ghobject_for_coll(cid),
-                              COLLECTION_ATTR, keys, &out);
+  int r = backend->lookup_strip_header(get_coll_for_coll(),
+                                       make_ghobject_for_coll(cid), &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
+
+  r = backend->get_values_with_header(header, COLLECTION_ATTR, keys, &out);
   if (r < 0) {
     dout(10) << __func__ << " could not get keys" << dendl;
     r = -EINVAL;
@@ -2224,7 +2267,7 @@ int KeyValueStore::_collection_setattr(coll_t c, const char *name,
   int r;
   bufferlist bl;
   map<string, bufferlist> out;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(get_coll_for_coll(),
                              make_ghobject_for_coll(c),
@@ -2237,7 +2280,7 @@ int KeyValueStore::_collection_setattr(coll_t c, const char *name,
   bl.append(reinterpret_cast<const char*>(value), size);
   out.insert(make_pair(string(name), bl));
 
-  t.set_buffer_keys(*header, COLLECTION_ATTR, out);
+  t.set_buffer_keys(header, COLLECTION_ATTR, out);
 
   dout(10) << __func__ << " " << c << " '"
            << name << "' len " << size << " = " << r << dendl;
@@ -2251,7 +2294,7 @@ int KeyValueStore::_collection_rmattr(coll_t c, const char *name,
 
   bufferlist bl;
   set<string> out;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(get_coll_for_coll(),
                                  make_ghobject_for_coll(c), &header, false);
@@ -2261,7 +2304,7 @@ int KeyValueStore::_collection_rmattr(coll_t c, const char *name,
   }
 
   out.insert(string(name));
-  r = t.remove_buffer_keys(*header, COLLECTION_ATTR, out);
+  r = t.remove_buffer_keys(header, COLLECTION_ATTR, out);
 
   dout(10) << __func__ << " " << c << " = " << r << dendl;
   return r;
@@ -2274,7 +2317,7 @@ int KeyValueStore::_collection_setattrs(coll_t cid,
   dout(15) << __func__ << " " << cid << dendl;
 
   map<string, bufferlist> attrs;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
   int r = t.lookup_cached_header(get_coll_for_coll(),
                                  make_ghobject_for_coll(cid),
                                  &header, false);
@@ -2288,7 +2331,7 @@ int KeyValueStore::_collection_setattrs(coll_t cid,
     attrs[it->first].push_back(it->second);
   }
 
-  t.set_buffer_keys(*header, COLLECTION_ATTR, attrs);
+  t.set_buffer_keys(header, COLLECTION_ATTR, attrs);
 
   dout(10) << __func__ << " " << cid << " = " << r << dendl;
   return r;
@@ -2302,7 +2345,7 @@ int KeyValueStore::_create_collection(coll_t c, BufferTransaction &t)
   dout(15) << __func__ << " " << c << dendl;
 
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
   bufferlist bl;
 
   r = t.lookup_cached_header(get_coll_for_coll(),
@@ -2327,7 +2370,7 @@ int KeyValueStore::_destroy_collection(coll_t c, BufferTransaction &t)
 
   int r;
   uint64_t modified_object = 0;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
   vector<ghobject_t> oids;
 
   r = t.lookup_cached_header(get_coll_for_coll(), make_ghobject_for_coll(c),
@@ -2344,7 +2387,7 @@ int KeyValueStore::_destroy_collection(coll_t c, BufferTransaction &t)
       continue;
 
     modified_object++;
-    if (!iter->second.deleted) {
+    if (!iter->second->deleted) {
       r = -ENOTEMPTY;
       goto out;
     }
@@ -2366,7 +2409,7 @@ int KeyValueStore::_destroy_collection(coll_t c, BufferTransaction &t)
     }
   }
 
-  r = t.clear_buffer(*header);
+  r = t.clear_buffer(header);
 
 out:
   dout(10) << __func__ << " " << c << " = " << r << dendl;
@@ -2382,7 +2425,7 @@ int KeyValueStore::_collection_add(coll_t c, coll_t oldcid,
            << o << dendl;
 
   bufferlist bl;
-  StripObjectMap::StripObjectHeader *header, *old_header;
+  StripObjectMap::StripObjectHeaderRef header, old_header;
 
   int r = t.lookup_cached_header(oldcid, o, &old_header, false);
   if (r < 0) {
@@ -2397,13 +2440,13 @@ int KeyValueStore::_collection_add(coll_t c, coll_t oldcid,
     goto out;
   }
 
-  r = _generic_read(*old_header, 0, old_header->max_size, bl, &t);
+  r = _generic_read(old_header, 0, old_header->max_size, bl, &t);
   if (r < 0) {
     r = -EINVAL;
     goto out;
   }
 
-  r = _generic_write(*header, 0, bl.length(), bl, t);
+  r = _generic_write(header, 0, bl.length(), bl, t);
   if (r < 0) {
     r = -EINVAL;
   }
@@ -2422,7 +2465,7 @@ int KeyValueStore::_collection_move_rename(coll_t oldcid,
   dout(15) << __func__ << " " << c << "/" << o << " from " << oldcid << "/"
            << oldoid << dendl;
   int r;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   r = t.lookup_cached_header(c, o, &header, false);
   if (r == 0) {
@@ -2438,7 +2481,7 @@ int KeyValueStore::_collection_move_rename(coll_t oldcid,
     return r;
   }
 
-  t.rename_buffer(*header, c, o);
+  t.rename_buffer(header, c, o);
 
   dout(10) << __func__ << " " << c << "/" << o << " from " << oldcid << "/"
            << oldoid << " = " << r << dendl;
@@ -2450,7 +2493,7 @@ int KeyValueStore::_collection_remove_recursive(const coll_t &cid,
 {
   dout(15) << __func__ << " " << cid << dendl;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(get_coll_for_coll(),
                                  make_ghobject_for_coll(cid),
@@ -2475,7 +2518,7 @@ int KeyValueStore::_collection_remove_recursive(const coll_t &cid,
     }
   }
 
-  r = t.clear_buffer(*header);
+  r = t.clear_buffer(header);
 
   dout(10) << __func__ << " " << cid  << " r = " << r << dendl;
   return 0;
@@ -2487,7 +2530,7 @@ int KeyValueStore::_collection_rename(const coll_t &cid, const coll_t &ncid,
   dout(10) << __func__ << " origin cid " << cid << " new cid " << ncid
            << dendl;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(get_coll_for_coll(),
                                  make_ghobject_for_coll(ncid),
@@ -2529,7 +2572,7 @@ int KeyValueStore::_collection_rename(const coll_t &cid, const coll_t &ncid,
     current = next;
   }
 
-  t.rename_buffer(*header, get_coll_for_coll(), make_ghobject_for_coll(ncid));
+  t.rename_buffer(header, get_coll_for_coll(), make_ghobject_for_coll(ncid));
 
   dout(10) << __func__ << " origin cid " << cid << " new cid " << ncid
            << dendl;
@@ -2557,9 +2600,9 @@ bool KeyValueStore::collection_exists(coll_t c)
 {
   dout(10) << __func__ << " " << dendl;
 
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
   int r = backend->lookup_strip_header(get_coll_for_coll(),
-                                       make_ghobject_for_coll(c), header);
+                                       make_ghobject_for_coll(c), &header);
   if (r < 0) {
     return false;
   }
@@ -2649,14 +2692,13 @@ int KeyValueStore::omap_get(coll_t c, const ghobject_t &hoid,
 {
   dout(15) << __func__ << " " << c << "/" << hoid << dendl;
 
-  StripObjectMap::StripObjectHeader header;
+  StripObjectMap::StripObjectHeaderRef header;
 
-  int r = backend->lookup_strip_header(c, hoid, header);
+  int r = backend->lookup_strip_header(c, hoid, &header);
   if (r < 0) {
     dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
     return r;
   }
-
 
   r = backend->get_with_header(header, OBJECT_OMAP, out);
   if (r < 0 && r != -ENOENT) {
@@ -2689,9 +2731,16 @@ int KeyValueStore::omap_get_header(coll_t c, const ghobject_t &hoid,
 
   set<string> keys;
   map<string, bufferlist> got;
+  StripObjectMap::StripObjectHeaderRef header;
+
+  int r = backend->lookup_strip_header(c, hoid, &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
 
   keys.insert(OBJECT_OMAP_HEADER_KEY);
-  int r = backend->get_values(c, hoid, OBJECT_OMAP_HEADER, keys, &got);
+  r = backend->get_values_with_header(header, OBJECT_OMAP_HEADER, keys, &got);
   if (r < 0 && r != -ENOENT) {
     dout(10) << __func__ << " err r =" << r << dendl;
     return r;
@@ -2709,7 +2758,14 @@ int KeyValueStore::omap_get_keys(coll_t c, const ghobject_t &hoid, set<string> *
 {
   dout(15) << __func__ << " " << c << "/" << hoid << dendl;
 
-  int r = backend->get_keys(c, hoid, OBJECT_OMAP, keys);
+  StripObjectMap::StripObjectHeaderRef header;
+  int r = backend->lookup_strip_header(c, hoid, &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
+
+  r = backend->get_keys_with_header(header, OBJECT_OMAP, keys);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
@@ -2722,7 +2778,14 @@ int KeyValueStore::omap_get_values(coll_t c, const ghobject_t &hoid,
 {
   dout(15) << __func__ << " " << c << "/" << hoid << dendl;
 
-  int r = backend->get_values(c, hoid, OBJECT_OMAP, keys, out);
+  StripObjectMap::StripObjectHeaderRef header;
+  int r = backend->lookup_strip_header(c, hoid, &header);
+  if (r < 0) {
+    dout(10) << __func__ << " lookup_strip_header failed: r =" << r << dendl;
+    return r;
+  }
+
+  r = backend->get_values_with_header(header, OBJECT_OMAP, keys, out);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
@@ -2753,7 +2816,7 @@ int KeyValueStore::_omap_clear(coll_t cid, const ghobject_t &hoid,
 {
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(cid, hoid, &header, false);
   if (r < 0) {
@@ -2763,13 +2826,13 @@ int KeyValueStore::_omap_clear(coll_t cid, const ghobject_t &hoid,
   }
 
   set<string> keys;
-  r = backend->get_keys_with_header(*header, OBJECT_OMAP, &keys);
+  r = backend->get_keys_with_header(header, OBJECT_OMAP, &keys);
   if (r < 0 && r != -ENOENT) {
     dout(10) << __func__ << " could not get omap_keys r = " << r << dendl;
     return r;
   }
 
-  r = t.remove_buffer_keys(*header, OBJECT_OMAP, keys);
+  r = t.remove_buffer_keys(header, OBJECT_OMAP, keys);
   if (r < 0) {
     dout(10) << __func__ << " could not remove keys r = " << r << dendl;
     return r;
@@ -2777,13 +2840,13 @@ int KeyValueStore::_omap_clear(coll_t cid, const ghobject_t &hoid,
 
   keys.clear();
   keys.insert(OBJECT_OMAP_HEADER_KEY);
-  r = t.remove_buffer_keys(*header, OBJECT_OMAP_HEADER, keys);
+  r = t.remove_buffer_keys(header, OBJECT_OMAP_HEADER, keys);
   if (r < 0) {
     dout(10) << __func__ << " could not remove keys r = " << r << dendl;
     return r;
   }
 
-  t.clear_buffer_keys(*header, OBJECT_OMAP_HEADER);
+  t.clear_buffer_keys(header, OBJECT_OMAP_HEADER);
 
   dout(10) << __func__ << " " << cid << "/" << hoid << " r = " << r << dendl;
   return 0;
@@ -2795,7 +2858,7 @@ int KeyValueStore::_omap_setkeys(coll_t cid, const ghobject_t &hoid,
 {
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(cid, hoid, &header, false);
   if (r < 0) {
@@ -2804,7 +2867,7 @@ int KeyValueStore::_omap_setkeys(coll_t cid, const ghobject_t &hoid,
     return r;
   }
 
-  t.set_buffer_keys(*header, OBJECT_OMAP, aset);
+  t.set_buffer_keys(header, OBJECT_OMAP, aset);
 
   return 0;
 }
@@ -2815,7 +2878,7 @@ int KeyValueStore::_omap_rmkeys(coll_t cid, const ghobject_t &hoid,
 {
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
 
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(cid, hoid, &header, false);
   if (r < 0) {
@@ -2824,7 +2887,7 @@ int KeyValueStore::_omap_rmkeys(coll_t cid, const ghobject_t &hoid,
     return r;
   }
 
-  r = t.remove_buffer_keys(*header, OBJECT_OMAP, keys);
+  r = t.remove_buffer_keys(header, OBJECT_OMAP, keys);
 
   dout(10) << __func__ << " " << cid << "/" << hoid << " r = " << r << dendl;
   return r;
@@ -2858,7 +2921,7 @@ int KeyValueStore::_omap_setheader(coll_t cid, const ghobject_t &hoid,
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
 
   map<string, bufferlist> sets;
-  StripObjectMap::StripObjectHeader *header;
+  StripObjectMap::StripObjectHeaderRef header;
 
   int r = t.lookup_cached_header(cid, hoid, &header, false);
   if (r < 0) {
@@ -2868,7 +2931,7 @@ int KeyValueStore::_omap_setheader(coll_t cid, const ghobject_t &hoid,
   }
 
   sets[OBJECT_OMAP_HEADER_KEY] = bl;
-  t.set_buffer_keys(*header, OBJECT_OMAP_HEADER, sets);
+  t.set_buffer_keys(header, OBJECT_OMAP_HEADER, sets);
   return 0;
 }
 
@@ -2878,7 +2941,7 @@ int KeyValueStore::_split_collection(coll_t cid, uint32_t bits, uint32_t rem,
   {
     dout(15) << __func__ << " " << cid << " bits: " << bits << dendl;
 
-    StripObjectMap::StripObjectHeader *header;
+    StripObjectMap::StripObjectHeaderRef header;
 
     int r = t.lookup_cached_header(get_coll_for_coll(),
                                    make_ghobject_for_coll(cid),
@@ -2964,11 +3027,54 @@ int KeyValueStore::_split_collection(coll_t cid, uint32_t bits, uint32_t rem,
   return 0;
 }
 
+int KeyValueStore::_set_alloc_hint(coll_t cid, const ghobject_t& oid,
+                                   uint64_t expected_object_size,
+                                   uint64_t expected_write_size,
+                                   BufferTransaction &t)
+{
+  dout(15) << __func__ << " " << cid << "/" << oid << " object_size "
+           << expected_object_size << " write_size "
+           << expected_write_size << dendl;
+
+  int r = 0;
+  StripObjectMap::StripObjectHeaderRef header;
+
+  r = t.lookup_cached_header(cid, oid, &header, false);
+  if (r < 0) {
+    dout(10) << __func__ << " " << cid << "/" << oid
+             << " failed to get header: r = " << r << dendl;
+    return r;
+  }
+
+  bool blank = true;
+  for (vector<char>::iterator it = header->bits.begin();
+       it != header->bits.end(); ++it) {
+    if (*it) {
+      blank = false;
+      break;
+    }
+  }
+
+  // Now only consider to change "strip_size" when the object is blank,
+  // because set_alloc_hint is expected to be very lightweight<O(1)>
+  if (blank) {
+    // header->strip_size = MIN(expected_write_size, m_keyvaluestore_max_expected_write_size);
+    // dout(20) << __func__ << " hint " << header->strip_size << " success" << dendl;
+  }
+
+  dout(10) << __func__ << "" << cid << "/" << oid << " object_size "
+           << expected_object_size << " write_size "
+           << expected_write_size << " = " << r << dendl;
+
+  return r;
+}
+
 const char** KeyValueStore::get_tracked_conf_keys() const
 {
   static const char* KEYS[] = {
     "keyvaluestore_queue_max_ops",
     "keyvaluestore_queue_max_bytes",
+    "keyvaluestore_strip_size",
     NULL
   };
   return KEYS;
@@ -2978,12 +3084,59 @@ void KeyValueStore::handle_conf_change(const struct md_config_t *conf,
                                        const std::set <std::string> &changed)
 {
   if (changed.count("keyvaluestore_queue_max_ops") ||
-      changed.count("keyvaluestore_queue_max_bytes")) {
+      changed.count("keyvaluestore_queue_max_bytes") ||
+      changed.count("keyvaluestore_max_expected_write_size")) {
     m_keyvaluestore_queue_max_ops = conf->keyvaluestore_queue_max_ops;
     m_keyvaluestore_queue_max_bytes = conf->keyvaluestore_queue_max_bytes;
+    m_keyvaluestore_max_expected_write_size = conf->keyvaluestore_max_expected_write_size;
+  }
+  if (changed.count("keyvaluestore_default_strip_size")) {
+    m_keyvaluestore_strip_size = conf->keyvaluestore_default_strip_size;
+    default_strip_size = m_keyvaluestore_strip_size;
   }
 }
 
 void KeyValueStore::dump_transactions(list<ObjectStore::Transaction*>& ls, uint64_t seq, OpSequencer *osr)
 {
+}
+
+
+// -- KVSuperblock --
+
+void KVSuperblock::encode(bufferlist &bl) const
+{
+  ENCODE_START(1, 1, bl);
+  compat_features.encode(bl);
+  ::encode(backend, bl);
+  ENCODE_FINISH(bl);
+}
+
+void KVSuperblock::decode(bufferlist::iterator &bl)
+{
+  DECODE_START(1, bl);
+  compat_features.decode(bl);
+  ::decode(backend, bl);
+  DECODE_FINISH(bl);
+}
+
+void KVSuperblock::dump(Formatter *f) const
+{
+  f->open_object_section("compat");
+  compat_features.dump(f);
+  f->dump_string("backend", backend);
+  f->close_section();
+}
+
+void KVSuperblock::generate_test_instances(list<KVSuperblock*>& o)
+{
+  KVSuperblock z;
+  o.push_back(new KVSuperblock(z));
+  CompatSet::FeatureSet feature_compat;
+  CompatSet::FeatureSet feature_ro_compat;
+  CompatSet::FeatureSet feature_incompat;
+  z.compat_features = CompatSet(feature_compat, feature_ro_compat,
+                                feature_incompat);
+  o.push_back(new KVSuperblock(z));
+  z.backend = "rocksdb";
+  o.push_back(new KVSuperblock(z));
 }

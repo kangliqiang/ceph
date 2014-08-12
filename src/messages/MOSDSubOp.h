@@ -25,7 +25,7 @@
 
 class MOSDSubOp : public Message {
 
-  static const int HEAD_VERSION = 9;
+  static const int HEAD_VERSION = 11;
   static const int COMPAT_VERSION = 1;
 
 public:
@@ -63,6 +63,8 @@ public:
 
   // piggybacked osd/og state
   eversion_t pg_trim_to;   // primary->replica: trim to here
+  eversion_t pg_trim_rollback_to;   // primary->replica: trim rollback
+                                    // info to here
   osd_peer_stat_t peer_stat;
 
   map<string,bufferlist> attrset;
@@ -89,6 +91,9 @@ public:
 
   hobject_t new_temp_oid;      ///< new temp object that we must now start tracking
   hobject_t discard_temp_oid;  ///< previously used temp object that we can now stop tracking
+
+  /// non-empty if this transaction involves a hit_set history update
+  boost::optional<pg_hit_set_history_t> updated_hit_set_history;
 
   int get_cost() const {
     if (ops.size() == 1 && ops[0].op.op == CEPH_OSD_OP_PULL)
@@ -166,8 +171,16 @@ public:
     } else {
       from = pg_shard_t(
 	get_source().num(),
-	ghobject_t::NO_SHARD);
-      pgid.shard = ghobject_t::NO_SHARD;
+	shard_id_t::NO_SHARD);
+      pgid.shard = shard_id_t::NO_SHARD;
+    }
+    if (header.version >= 10) {
+      ::decode(updated_hit_set_history, p);
+    }
+    if (header.version >= 11) {
+      ::decode(pg_trim_rollback_to, p);
+    } else {
+      pg_trim_rollback_to = pg_trim_to;
     }
   }
 
@@ -217,6 +230,8 @@ public:
     ::encode(discard_temp_oid, payload);
     ::encode(from, payload);
     ::encode(pgid.shard, payload);
+    ::encode(updated_hit_set_history, payload);
+    ::encode(pg_trim_rollback_to, payload);
   }
 
   MOSDSubOp()
@@ -258,6 +273,8 @@ public:
     out << " v " << version
 	<< " snapset=" << snapset << " snapc=" << snapc;    
     if (!data_subset.empty()) out << " subset " << data_subset;
+    if (updated_hit_set_history)
+      out << ", has_updated_hit_set_history";
     out << ")";
   }
 };

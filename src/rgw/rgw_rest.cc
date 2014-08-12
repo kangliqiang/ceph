@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <errno.h>
 #include <limits.h>
 
@@ -36,6 +39,7 @@ static struct rgw_http_attr rgw_to_http_attr_list[] = {
   { RGW_ATTR_CACHE_CONTROL, "Cache-Control"},
   { RGW_ATTR_CONTENT_DISP, "Content-Disposition"},
   { RGW_ATTR_CONTENT_ENC, "Content-Encoding"},
+  { RGW_ATTR_USER_MANIFEST, "X-Object-Manifest"},
   { NULL, NULL},
 };
 

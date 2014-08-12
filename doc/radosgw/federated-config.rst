@@ -146,7 +146,7 @@ to create a pool::
 .. topic:: CRUSH Maps
 
 	When deploying a Ceph Storage Cluster for the entire region, consider 
-	using a CRUSH rule for the the zone such that you do NOT	have overlapping 
+	using a CRUSH rule for the zone such that you do NOT have overlapping
 	failure domains. See `CRUSH Map`_ for details.
 
 When you have completed this step, execute the following to ensure that
@@ -179,8 +179,8 @@ each node containing an instance.
 #. Add capabilities to each key. See `Configuration Reference - Pools`_ for details
    on the effect of write permissions for the monitor and creating pools. ::
 
-	sudo ceph-authtool -n client.radosgw.us-east-1 --cap osd 'allow rwx' --cap mon 'allow rw' /etc/ceph/ceph.client.radosgw.keyring
-	sudo ceph-authtool -n client.radosgw.us-west-1 --cap osd 'allow rwx' --cap mon 'allow rw' /etc/ceph/ceph.client.radosgw.keyring
+	sudo ceph-authtool -n client.radosgw.us-east-1 --cap osd 'allow rwx' --cap mon 'allow rwx' /etc/ceph/ceph.client.radosgw.keyring
+	sudo ceph-authtool -n client.radosgw.us-west-1 --cap osd 'allow rwx' --cap mon 'allow rwx' /etc/ceph/ceph.client.radosgw.keyring
 
 
 #. Once you have created a keyring and key to enable the Ceph Object Gateway 

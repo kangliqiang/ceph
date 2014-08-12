@@ -47,19 +47,26 @@ int XfsFileStoreBackend::set_extsize(int fd, unsigned int val)
   if (fstat(fd, &sb) < 0) {
     ret = -errno;
     dout(0) << "set_extsize: fstat: " << cpp_strerror(ret) << dendl;
-    goto out;
+    return ret;
   }
   if (!S_ISREG(sb.st_mode)) {
-    ret = -EINVAL;
     dout(0) << "set_extsize: invalid target file type" << dendl;
-    goto out;
+    return -EINVAL;
   }
 
   if (ioctl(fd, XFS_IOC_FSGETXATTR, &fsx) < 0) {
     ret = -errno;
     dout(0) << "set_extsize: FSGETXATTR: " << cpp_strerror(ret) << dendl;
-    goto out;
+    return ret;
   }
+
+  // already set?
+  if ((fsx.fsx_xflags & XFS_XFLAG_EXTSIZE) && fsx.fsx_extsize == val)
+    return 0;
+
+  // xfs won't change extent size if any extents are allocated
+  if (fsx.fsx_nextents != 0)
+    return 0;
 
   fsx.fsx_xflags |= XFS_XFLAG_EXTSIZE;
   fsx.fsx_extsize = val;
@@ -67,12 +74,10 @@ int XfsFileStoreBackend::set_extsize(int fd, unsigned int val)
   if (ioctl(fd, XFS_IOC_FSSETXATTR, &fsx) < 0) {
     ret = -errno;
     dout(0) << "set_extsize: FSSETXATTR: " << cpp_strerror(ret) << dendl;
-    goto out;
+    return ret;
   }
-  ret = 0;
 
-out:
-  return ret;
+  return 0;
 }
 
 int XfsFileStoreBackend::detect_features()
@@ -98,15 +103,20 @@ int XfsFileStoreBackend::detect_features()
     goto out_close;
   }
 
-  ret = set_extsize(fd, 1U << 15); // a few pages
-  if (ret) {
-    ret = 0;
-    dout(0) << "detect_feature: failed to set test file extsize, assuming extsize is NOT supported" << dendl;
-    goto out_close;
+  if (g_conf->filestore_xfs_extsize) {
+    ret = set_extsize(fd, 1U << 15); // a few pages
+    if (ret) {
+      ret = 0;
+      dout(0) << "detect_feature: failed to set test file extsize, assuming extsize is NOT supported" << dendl;
+      goto out_close;
+    } else {
+      dout(0) << "detect_feature: extsize is supported" << dendl;
+      m_has_extsize = true;
+    }
+  } else {
+    dout(0) << "detect_feature: extsize is disabled by conf" << dendl;
   }
 
-  dout(0) << "detect_feature: extsize is supported" << dendl;
-  m_has_extsize = true;
 
 out_close:
   TEMP_FAILURE_RETRY(::close(fd));

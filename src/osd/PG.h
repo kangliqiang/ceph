@@ -207,7 +207,7 @@ protected:
   OSDMapRef last_persisted_osdmap_ref;
   PGPool pool;
 
-  void queue_op(OpRequestRef op);
+  void queue_op(OpRequestRef& op);
   void take_op_map_waiters();
 
   void update_osdmap_ref(OSDMapRef newmap) {
@@ -309,10 +309,10 @@ public:
     map<hobject_t, set<pg_shard_t> > missing_loc;
     set<pg_shard_t> missing_loc_sources;
     PG *pg;
-    boost::scoped_ptr<PGBackend::IsReadablePredicate> is_readable;
-    boost::scoped_ptr<PGBackend::IsRecoverablePredicate> is_recoverable;
     set<pg_shard_t> empty_set;
   public:
+    boost::scoped_ptr<PGBackend::IsReadablePredicate> is_readable;
+    boost::scoped_ptr<PGBackend::IsRecoverablePredicate> is_recoverable;
     MissingLoc(PG *pg)
       : pg(pg) {}
     void set_backend_predicates(
@@ -351,6 +351,10 @@ public:
 	  ++ret;
       }
       return ret;
+    }
+
+    const map<hobject_t, pg_missing_t::item> &get_all_missing() {
+      return needs_recovery_map;
     }
 
     void clear() {
@@ -443,6 +447,25 @@ public:
   eversion_t  last_complete_ondisk;  // last_complete that has committed.
   eversion_t  last_update_applied;
 
+
+  struct C_UpdateLastRollbackInfoTrimmedToApplied : Context {
+    PGRef pg;
+    epoch_t e;
+    eversion_t v;
+    C_UpdateLastRollbackInfoTrimmedToApplied(PG *pg, epoch_t e, eversion_t v)
+      : pg(pg), e(e), v(v) {}
+    void finish(int) {
+      pg->lock();
+      if (!pg->pg_has_reset_since(e)) {
+	pg->last_rollback_info_trimmed_to_applied = v;
+      }
+      pg->unlock();
+    }
+  };
+  // entries <= last_rollback_info_trimmed_to_applied have been trimmed,
+  // and the transaction has applied
+  eversion_t  last_rollback_info_trimmed_to_applied;
+
   // primary state
  public:
   pg_shard_t primary;
@@ -483,6 +506,12 @@ public:
 
 
 public:    
+  struct BufferedRecoveryMessages {
+    map<int, map<spg_t, pg_query_t> > query_map;
+    map<int, vector<pair<pg_notify_t, pg_interval_map_t> > > info_map;
+    map<int, vector<pair<pg_notify_t, pg_interval_map_t> > > notify_list;
+  };
+
   struct RecoveryCtx {
     utime_t start_time;
     map<int, map<spg_t, pg_query_t> > *query_map;
@@ -504,6 +533,48 @@ public:
 	on_applied(on_applied),
 	on_safe(on_safe),
 	transaction(transaction) {}
+
+    RecoveryCtx(BufferedRecoveryMessages &buf, RecoveryCtx &rctx)
+      : query_map(&(buf.query_map)),
+	info_map(&(buf.info_map)),
+	notify_list(&(buf.notify_list)),
+	on_applied(rctx.on_applied),
+	on_safe(rctx.on_safe),
+	transaction(rctx.transaction) {}
+
+    void accept_buffered_messages(BufferedRecoveryMessages &m) {
+      assert(query_map);
+      assert(info_map);
+      assert(notify_list);
+      for (map<int, map<spg_t, pg_query_t> >::iterator i = m.query_map.begin();
+	   i != m.query_map.end();
+	   ++i) {
+	map<spg_t, pg_query_t> &omap = (*query_map)[i->first];
+	for (map<spg_t, pg_query_t>::iterator j = i->second.begin();
+	     j != i->second.end();
+	     ++j) {
+	  omap[j->first] = j->second;
+	}
+      }
+      for (map<int, vector<pair<pg_notify_t, pg_interval_map_t> > >::iterator i
+	     = m.info_map.begin();
+	   i != m.info_map.end();
+	   ++i) {
+	vector<pair<pg_notify_t, pg_interval_map_t> > &ovec =
+	  (*info_map)[i->first];
+	ovec.reserve(ovec.size() + i->second.size());
+	ovec.insert(ovec.end(), i->second.begin(), i->second.end());
+      }
+      for (map<int, vector<pair<pg_notify_t, pg_interval_map_t> > >::iterator i
+	     = m.notify_list.begin();
+	   i != m.notify_list.end();
+	   ++i) {
+	vector<pair<pg_notify_t, pg_interval_map_t> > &ovec =
+	  (*notify_list)[i->first];
+	ovec.reserve(ovec.size() + i->second.size());
+	ovec.insert(ovec.end(), i->second.begin(), i->second.end());
+      }
+    }
   };
 
   struct NamedState {
@@ -512,7 +583,7 @@ public:
     const char *get_state_name() { return state_name; }
     NamedState(CephContext *cct_, const char *state_name_)
       : state_name(state_name_),
-        enter_time(ceph_clock_now(cct_)) {};
+        enter_time(ceph_clock_now(cct_)) {}
     virtual ~NamedState() {}
   };
 
@@ -705,6 +776,11 @@ public:
   
   bool needs_recovery() const;
   bool needs_backfill() const;
+
+  /// get log recovery reservation priority
+  unsigned get_recovery_priority();
+  /// get backfill reservation priority
+  unsigned get_backfill_priority();
 
   void mark_clean();  ///< mark an active pg clean
 
@@ -943,8 +1019,7 @@ public:
       waiting_on(0), shallow_errors(0), deep_errors(0), fixed(0),
       active_rep_scrub(0),
       must_scrub(false), must_deep_scrub(false), must_repair(false),
-      classic(false),
-      finalizing(false), is_chunky(false), state(INACTIVE),
+      state(INACTIVE),
       deep(false)
     {
     }
@@ -979,12 +1054,7 @@ public:
     // Map from object with errors to good peer
     map<hobject_t, pair<ScrubMap::object, pg_shard_t> > authoritative;
 
-    // classic scrub
-    bool classic;
-    bool finalizing;
-
     // chunky scrub
-    bool is_chunky;
     hobject_t start, end;
     eversion_t subset_last_update;
 
@@ -1041,9 +1111,6 @@ public:
       if (!block_writes)
 	return false;
 
-      if (!is_chunky)
-	return true;
-
       if (soid >= start && soid < end)
 	return true;
 
@@ -1052,8 +1119,6 @@ public:
 
     // clear all state
     void reset() {
-      classic = false;
-      finalizing = false;
       block_writes = false;
       active = false;
       queue_snap_trim = false;
@@ -1104,6 +1169,9 @@ public:
   void scrub_clear_state();
   bool scrub_gather_replica_maps();
   void _scan_snaps(ScrubMap &map);
+  void _scan_rollback_obs(
+    const vector<ghobject_t> &rollback_obs,
+    ThreadPool::TPHandle &handle);
   void _request_scrub_map_classic(pg_shard_t replica, eversion_t version);
   void _request_scrub_map(pg_shard_t replica, eversion_t version,
                           hobject_t start, hobject_t end, bool deep);
@@ -1114,6 +1182,13 @@ public:
   void build_scrub_map(ScrubMap &map, ThreadPool::TPHandle &handle);
   void build_inc_scrub_map(
     ScrubMap &map, eversion_t v, ThreadPool::TPHandle &handle);
+  /**
+   * returns true if [begin, end) is good to scrub at this time
+   * a false return value obliges the implementer to requeue scrub when the
+   * condition preventing scrub clears
+   */
+  virtual bool _range_available_for_scrub(
+    const hobject_t &begin, const hobject_t &end) = 0;
   virtual void _scrub(ScrubMap &map) { }
   virtual void _scrub_clear_state() { }
   virtual void _scrub_finish() { }
@@ -1127,7 +1202,7 @@ public:
     const hobject_t &hoid,
     const map<string, bufferptr> &attrs,
     pg_shard_t osd,
-    ostream &out) { return false; };
+    ostream &out) { return false; }
   void clear_scrub_reserved();
   void scrub_reserve_replicas();
   void scrub_unreserve_replicas();
@@ -1322,10 +1397,17 @@ public:
 
   TrivialEvent(AllReplicasActivated)
 
+  TrivialEvent(IntervalFlush)
+
   /* Encapsulates PG recovery process */
   class RecoveryState {
     void start_handle(RecoveryCtx *new_ctx);
     void end_handle();
+  public:
+    void begin_block_outgoing();
+    void end_block_outgoing();
+    void clear_blocked_outgoing();
+  private:
 
     /* States */
     struct Initial;
@@ -1349,40 +1431,47 @@ public:
 
       /* Accessor functions for state methods */
       ObjectStore::Transaction* get_cur_transaction() {
+	assert(state->rctx);
 	assert(state->rctx->transaction);
 	return state->rctx->transaction;
       }
 
       void send_query(pg_shard_t to, const pg_query_t &query) {
+	assert(state->rctx);
 	assert(state->rctx->query_map);
 	(*state->rctx->query_map)[to.osd][spg_t(pg->info.pgid.pgid, to.shard)] =
 	  query;
       }
 
       map<int, map<spg_t, pg_query_t> > *get_query_map() {
+	assert(state->rctx);
 	assert(state->rctx->query_map);
 	return state->rctx->query_map;
       }
 
       map<int, vector<pair<pg_notify_t, pg_interval_map_t> > > *get_info_map() {
+	assert(state->rctx);
 	assert(state->rctx->info_map);
 	return state->rctx->info_map;
       }
 
       list< Context* > *get_on_safe_context_list() {
+	assert(state->rctx);
 	assert(state->rctx->on_safe);
 	return &(state->rctx->on_safe->contexts);
       }
 
       list< Context * > *get_on_applied_context_list() {
+	assert(state->rctx);
 	assert(state->rctx->on_applied);
 	return &(state->rctx->on_applied->contexts);
       }
 
-      RecoveryCtx *get_recovery_ctx() { return state->rctx; }
+      RecoveryCtx *get_recovery_ctx() { return &*(state->rctx); }
 
       void send_notify(pg_shard_t to,
 		       const pg_notify_t &info, const pg_interval_map_t &pi) {
+	assert(state->rctx);
 	assert(state->rctx->notify_list);
 	(*state->rctx->notify_list)[to.osd].push_back(make_pair(info, pi));
       }
@@ -1428,12 +1517,14 @@ public:
 	boost::statechart::custom_reaction< ActMap >,
 	boost::statechart::custom_reaction< NullEvt >,
 	boost::statechart::custom_reaction< FlushedEvt >,
+	boost::statechart::custom_reaction< IntervalFlush >,
 	boost::statechart::transition< boost::statechart::event_base, Crashed >
 	> reactions;
       boost::statechart::result react(const QueryState& q);
       boost::statechart::result react(const AdvMap&);
       boost::statechart::result react(const ActMap&);
       boost::statechart::result react(const FlushedEvt&);
+      boost::statechart::result react(const IntervalFlush&);
       boost::statechart::result react(const boost::statechart::event_base&) {
 	return discard_event();
       }
@@ -1450,11 +1541,13 @@ public:
 	boost::statechart::custom_reaction< AdvMap >,
 	boost::statechart::custom_reaction< NullEvt >,
 	boost::statechart::custom_reaction< FlushedEvt >,
+	boost::statechart::custom_reaction< IntervalFlush >,
 	boost::statechart::transition< boost::statechart::event_base, Crashed >
 	> reactions;
       boost::statechart::result react(const QueryState& q);
       boost::statechart::result react(const AdvMap&);
       boost::statechart::result react(const FlushedEvt&);
+      boost::statechart::result react(const IntervalFlush&);
       boost::statechart::result react(const boost::statechart::event_base&) {
 	return discard_event();
       }
@@ -1844,10 +1937,23 @@ public:
 
     RecoveryMachine machine;
     PG *pg;
-    RecoveryCtx *rctx;
+
+    /// context passed in by state machine caller
+    RecoveryCtx *orig_ctx;
+
+    /// populated if we are buffering messages pending a flush
+    boost::optional<BufferedRecoveryMessages> messages_pending_flush;
+
+    /**
+     * populated between start_handle() and end_handle(), points into
+     * the message lists for messages_pending_flush while blocking messages
+     * or into orig_ctx otherwise
+     */
+    boost::optional<RecoveryCtx> rctx;
 
   public:
-    RecoveryState(PG *pg) : machine(this, pg), pg(pg), rctx(0) {
+    RecoveryState(PG *pg)
+      : machine(this, pg), pg(pg), orig_ctx(0) {
       machine.initiate();
     }
 
@@ -1877,9 +1983,10 @@ public:
   // Prevent copying
   PG(const PG& rhs);
   PG& operator=(const PG& rhs);
+  const spg_t pg_id;
 
  public:
-  spg_t      get_pgid() const { return info.pgid; }
+  const spg_t&      get_pgid() const { return pg_id; }
   int        get_nrep() const { return acting.size(); }
 
   void init_primary_up_acting(
@@ -1889,30 +1996,30 @@ public:
     int new_acting_primary) {
     actingset.clear();
     acting = newacting;
-    for (shard_id_t i = 0; i < acting.size(); ++i) {
+    for (uint8_t i = 0; i < acting.size(); ++i) {
       if (acting[i] != CRUSH_ITEM_NONE)
 	actingset.insert(
 	  pg_shard_t(
 	    acting[i],
-	    pool.info.ec_pool() ? i : ghobject_t::NO_SHARD));
+	    pool.info.ec_pool() ? shard_id_t(i) : shard_id_t::NO_SHARD));
     }
     up = newup;
     if (!pool.info.ec_pool()) {
-      up_primary = pg_shard_t(new_up_primary, ghobject_t::no_shard());
-      primary = pg_shard_t(new_acting_primary, ghobject_t::no_shard());
+      up_primary = pg_shard_t(new_up_primary, shard_id_t::NO_SHARD);
+      primary = pg_shard_t(new_acting_primary, shard_id_t::NO_SHARD);
       return;
     }
     up_primary = pg_shard_t();
     primary = pg_shard_t();
-    for (shard_id_t i = 0; i < up.size(); ++i) {
+    for (uint8_t i = 0; i < up.size(); ++i) {
       if (up[i] == new_up_primary) {
-	up_primary = pg_shard_t(up[i], i);
+	up_primary = pg_shard_t(up[i], shard_id_t(i));
 	break;
       }
     }
-    for (shard_id_t i = 0; i < acting.size(); ++i) {
+    for (uint8_t i = 0; i < acting.size(); ++i) {
       if (acting[i] == new_acting_primary) {
-	primary = pg_shard_t(acting[i], i);
+	primary = pg_shard_t(acting[i], shard_id_t(i));
 	break;
       }
     }
@@ -1951,11 +2058,11 @@ public:
 
   void init(
     int role,
-    vector<int>& up,
+    const vector<int>& up,
     int up_primary,
-    vector<int>& acting,
+    const vector<int>& acting,
     int acting_primary,
-    pg_history_t& history,
+    const pg_history_t& history,
     pg_interval_map_t& pim,
     bool backfill,
     ObjectStore::Transaction *t);
@@ -1985,14 +2092,17 @@ public:
 
   void add_log_entry(pg_log_entry_t& e, bufferlist& log_bl);
   void append_log(
-    vector<pg_log_entry_t>& logv, eversion_t trim_to, ObjectStore::Transaction &t,
+    vector<pg_log_entry_t>& logv,
+    eversion_t trim_to,
+    eversion_t trim_rollback_to,
+    ObjectStore::Transaction &t,
     bool transaction_applied = true);
   bool check_log_for_corruption(ObjectStore *store);
   void trim_peers();
 
   std::string get_corrupt_pg_log_name() const;
   static int read_info(
-    ObjectStore *store, const coll_t coll,
+    ObjectStore *store, const coll_t &coll,
     bufferlist &bl, pg_info_t &info, map<epoch_t,pg_interval_t> &past_intervals,
     hobject_t &biginfo_oid, hobject_t &infos_oid,
     interval_set<snapid_t>  &snap_collections, __u8 &);
@@ -2003,7 +2113,7 @@ public:
     vector<pg_log_entry_t> &log_entries,
     ObjectStore::Transaction& t);
 
-  void filter_snapc(SnapContext& snapc);
+  void filter_snapc(vector<snapid_t> &snaps);
 
   void log_weirdness();
 
@@ -2015,6 +2125,7 @@ public:
   /// share new pg log entries after a pg is active
   void share_pg_log();
 
+  void reset_interval_flush();
   void start_peering_interval(
     const OSDMapRef lastmap,
     const vector<int>& newup, int up_primary,
@@ -2033,36 +2144,38 @@ public:
   void fulfill_info(pg_shard_t from, const pg_query_t &query,
 		    pair<pg_shard_t, pg_info_t> &notify_info);
   void fulfill_log(pg_shard_t from, const pg_query_t &query, epoch_t query_epoch);
-  bool is_split(OSDMapRef lastmap, OSDMapRef nextmap);
-  bool acting_up_affected(
-    int newupprimary, int newactingprimary,
-    const vector<int>& newup, const vector<int>& newacting);
+
+  bool should_restart_peering(
+    int newupprimary,
+    int newactingprimary,
+    const vector<int>& newup,
+    const vector<int>& newacting,
+    OSDMapRef lastmap,
+    OSDMapRef osdmap);
 
   // OpRequest queueing
-  bool can_discard_op(OpRequestRef op);
+  bool can_discard_op(OpRequestRef& op);
   bool can_discard_scan(OpRequestRef op);
   bool can_discard_backfill(OpRequestRef op);
-  bool can_discard_request(OpRequestRef op);
+  bool can_discard_request(OpRequestRef& op);
 
   template<typename T, int MSGTYPE>
-  bool can_discard_replica_op(OpRequestRef op);
+  bool can_discard_replica_op(OpRequestRef& op);
 
-  static bool op_must_wait_for_map(OSDMapRef curmap, OpRequestRef op);
-
-  static bool split_request(OpRequestRef op, unsigned match, unsigned bits);
+  static bool op_must_wait_for_map(epoch_t cur_epoch, OpRequestRef& op);
 
   bool old_peering_msg(epoch_t reply_epoch, epoch_t query_epoch);
   bool old_peering_evt(CephPeeringEvtRef evt) {
     return old_peering_msg(evt->get_epoch_sent(), evt->get_epoch_requested());
   }
-  static bool have_same_or_newer_map(OSDMapRef osdmap, epoch_t e) {
-    return e <= osdmap->get_epoch();
+  static bool have_same_or_newer_map(epoch_t cur_epoch, epoch_t e) {
+    return e <= cur_epoch;
   }
   bool have_same_or_newer_map(epoch_t e) {
     return e <= get_osdmap()->get_epoch();
   }
 
-  bool op_has_sufficient_caps(OpRequestRef op);
+  bool op_has_sufficient_caps(OpRequestRef& op);
 
 
   // recovery bits
@@ -2094,11 +2207,11 @@ public:
 
   // abstract bits
   virtual void do_request(
-    OpRequestRef op,
+    OpRequestRef& op,
     ThreadPool::TPHandle &handle
   ) = 0;
 
-  virtual void do_op(OpRequestRef op) = 0;
+  virtual void do_op(OpRequestRef& op) = 0;
   virtual void do_sub_op(OpRequestRef op) = 0;
   virtual void do_sub_op_reply(OpRequestRef op) = 0;
   virtual void do_scan(
@@ -2120,9 +2233,11 @@ public:
   virtual void check_blacklisted_watchers() = 0;
   virtual void get_watchers(std::list<obj_watch_item_t>&) = 0;
 
-  virtual void agent_work(int max) = 0;
+  virtual bool agent_work(int max) = 0;
   virtual void agent_stop() = 0;
+  virtual void agent_delay() = 0;
   virtual void agent_clear() = 0;
+  virtual void agent_choose_mode_restart() = 0;
 };
 
 ostream& operator<<(ostream& out, const PG& pg);

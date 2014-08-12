@@ -76,7 +76,8 @@ void LogClient::do_log(clog_type type, std::stringstream& ss)
 void LogClient::do_log(clog_type type, const std::string& s)
 {
   Mutex::Locker l(log_lock);
-  ldout(cct,0) << "log " << type << " : " << s << dendl;
+  int lvl = (type == CLOG_ERROR ? -1 : 0);
+  ldout(cct,lvl) << "log " << type << " : " << s << dendl;
   LogEntry e;
   e.who = messenger->get_myinst();
   e.stamp = ceph_clock_now(cct);
@@ -99,7 +100,7 @@ void LogClient::do_log(clog_type type, const std::string& s)
       assert(messenger->get_myname().is_mon());
       ldout(cct,10) << "send_log to self" << dendl;
       Message *log = _get_mon_log_message();
-      messenger->send_message(log, messenger->get_myinst());
+      messenger->get_loopback_connection()->send_message(log);
     }
   }
 }

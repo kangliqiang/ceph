@@ -105,13 +105,13 @@ ostream &operator<<(ostream &lhs, const ECBackend::ReadOp &rhs)
 
 void ECBackend::ReadOp::dump(Formatter *f) const
 {
-  f->dump_stream("tid") << tid;
+  f->dump_unsigned("tid", tid);
   if (op && op->get_req()) {
     f->dump_stream("op") << *(op->get_req());
   }
   f->dump_stream("to_read") << to_read;
   f->dump_stream("complete") << complete;
-  f->dump_stream("priority") << priority;
+  f->dump_int("priority", priority);
   f->dump_stream("obj_to_source") << obj_to_source;
   f->dump_stream("source_to_obj") << source_to_obj;
   f->dump_stream("in_progress") << in_progress;
@@ -158,7 +158,7 @@ void ECBackend::RecoveryOp::dump(Formatter *f) const
   f->dump_stream("missing_on_shards") << missing_on_shards;
   f->dump_stream("recovery_info") << recovery_info;
   f->dump_stream("recovery_progress") << recovery_progress;
-  f->dump_stream("pending_read") << pending_read;
+  f->dump_bool("pending_read", pending_read);
   f->dump_stream("state") << tostr(state);
   f->dump_stream("waiting_on_pushes") << waiting_on_pushes;
   f->dump_stream("extent_requested") << extent_requested;
@@ -470,18 +470,27 @@ void ECBackend::continue_recovery_op(
       assert(!op.recovery_progress.data_complete);
       set<int> want(op.missing_on_shards.begin(), op.missing_on_shards.end());
       set<pg_shard_t> to_read;
+      uint64_t recovery_max_chunk = get_recovery_chunk_size();
       int r = get_min_avail_to_read_shards(
 	op.hoid, want, true, &to_read);
-      assert(r == 0);
+      if (r != 0) {
+	// we must have lost a recovery source
+	assert(!op.recovery_progress.first);
+	dout(10) << __func__ << ": canceling recovery op for obj " << op.hoid
+		 << dendl;
+	get_parent()->cancel_pull(op.hoid);
+	recovery_ops.erase(op.hoid);
+	return;
+      }
       m->read(
 	this,
 	op.hoid,
 	op.recovery_progress.data_recovered_to,
-	get_recovery_chunk_size(),
+	recovery_max_chunk,
 	to_read,
 	op.recovery_progress.first);
       op.extent_requested = make_pair(op.recovery_progress.data_recovered_to,
-				      get_recovery_chunk_size());
+				      recovery_max_chunk);
       dout(10) << __func__ << ": IDLE return " << op << dendl;
       return;
     }
@@ -491,7 +500,7 @@ void ECBackend::continue_recovery_op(
       assert(op.returned_data.size());
       op.state = RecoveryOp::WRITING;
       ObjectRecoveryProgress after_progress = op.recovery_progress;
-      after_progress.data_recovered_to += get_recovery_chunk_size();
+      after_progress.data_recovered_to += op.extent_requested.second;
       after_progress.first = false;
       if (after_progress.data_recovered_to >= op.obc->obs.oi.size) {
 	after_progress.data_recovered_to =
@@ -818,7 +827,9 @@ void ECBackend::handle_sub_write(
   clear_temp_objs(op.temp_removed);
   get_parent()->log_operation(
     op.log_entries,
+    op.updated_hit_set_history,
     op.trim_to,
+    op.trim_rollback_to,
     !(op.t.empty()),
     localt);
   localt->append(op.t);
@@ -1081,11 +1092,11 @@ void ECBackend::filter_read_op(
   }
 
   if (op.in_progress.empty()) {
-    get_parent()->schedule_work(
+    get_parent()->schedule_recovery_work(
       get_parent()->bless_gencontext(
 	new FinishReadOp(this, op.tid)));
   }
-};
+}
 
 void ECBackend::check_recovery_sources(const OSDMapRef osdmap)
 {
@@ -1110,8 +1121,9 @@ void ECBackend::check_recovery_sources(const OSDMapRef osdmap)
   }
 }
 
-void ECBackend::_on_change(ObjectStore::Transaction *t)
+void ECBackend::on_change()
 {
+  dout(10) << __func__ << dendl;
   writing.clear();
   tid_to_op_map.clear();
   for (map<ceph_tid_t, ReadOp>::iterator i = tid_to_read_map.begin();
@@ -1200,7 +1212,9 @@ void ECBackend::submit_transaction(
   const eversion_t &at_version,
   PGTransaction *_t,
   const eversion_t &trim_to,
+  const eversion_t &trim_rollback_to,
   vector<pg_log_entry_t> &log_entries,
+  boost::optional<pg_hit_set_history_t> &hset_history,
   Context *on_local_applied_sync,
   Context *on_all_applied,
   Context *on_all_commit,
@@ -1214,7 +1228,9 @@ void ECBackend::submit_transaction(
   op->hoid = hoid;
   op->version = at_version;
   op->trim_to = trim_to;
+  op->trim_rollback_to = trim_rollback_to;
   op->log_entries.swap(log_entries);
+  std::swap(op->updated_hit_set_history, hset_history);
   op->on_local_applied_sync = on_local_applied_sync;
   op->on_all_applied = on_all_applied;
   op->on_all_commit = on_all_commit;
@@ -1334,8 +1350,8 @@ int ECBackend::get_min_avail_to_read_shards(
   for (set<int>::iterator i = need.begin();
        i != need.end();
        ++i) {
-    assert(shards.count(*i));
-    to_read->insert(shards[*i]);
+    assert(shards.count(shard_id_t(*i)));
+    to_read->insert(shards[shard_id_t(*i)]);
   }
   return 0;
 }
@@ -1519,7 +1535,9 @@ void ECBackend::start_write(Op *op) {
       should_send ? iter->second : ObjectStore::Transaction(),
       op->version,
       op->trim_to,
+      op->trim_rollback_to,
       op->log_entries,
+      op->updated_hit_set_history,
       op->temp_added,
       op->temp_cleared);
     if (*i == get_parent()->whoami_shard()) {

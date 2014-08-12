@@ -66,9 +66,9 @@ enum {
   l_cluster_num_osd_up,
   l_cluster_num_osd_in,
   l_cluster_osd_epoch,
-  l_cluster_osd_kb,
-  l_cluster_osd_kb_used,
-  l_cluster_osd_kb_avail,
+  l_cluster_osd_bytes,
+  l_cluster_osd_bytes_used,
+  l_cluster_osd_bytes_avail,
   l_cluster_num_pool,
   l_cluster_num_pg,
   l_cluster_num_pg_active_clean,
@@ -83,6 +83,19 @@ enum {
   l_cluster_num_mds_failed,
   l_cluster_mds_epoch,
   l_cluster_last,
+};
+
+enum {
+  l_mon_first = 456000,
+  l_mon_num_sessions,
+  l_mon_session_add,
+  l_mon_session_rm,
+  l_mon_session_trim,
+  l_mon_num_elections,
+  l_mon_election_call,
+  l_mon_election_win,
+  l_mon_election_lose,
+  l_mon_last,
 };
 
 class QuorumService;
@@ -106,7 +119,8 @@ struct MonCommand;
 
 #define COMPAT_SET_LOC "feature_set"
 
-class Monitor : public Dispatcher {
+class Monitor : public Dispatcher,
+                public md_config_obs_t {
 public:
   // me
   string name;
@@ -771,6 +785,12 @@ public:
 
   static int check_features(MonitorDBStore *store);
 
+  // config observer
+  virtual const char** get_tracked_conf_keys() const;
+  virtual void handle_conf_change(const struct md_config_t *conf,
+                                  const std::set<std::string> &changed);
+
+  int sanitize_options();
   int preinit();
   int init();
   void init_paxos();
@@ -957,6 +977,6 @@ struct MonCommand {
     DECODE_FINISH(bl);
   }
 };
-WRITE_CLASS_ENCODER(MonCommand);
+WRITE_CLASS_ENCODER(MonCommand)
 
 #endif

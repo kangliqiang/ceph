@@ -69,7 +69,7 @@ public:
     OpRequestRef op
     );
 
-  void _on_change(ObjectStore::Transaction *t);
+  void on_change();
   void clear_state();
   void on_flushed();
 
@@ -342,7 +342,9 @@ public:
     const eversion_t &at_version,
     PGTransaction *t,
     const eversion_t &trim_to,
+    const eversion_t &trim_rollback_to,
     vector<pg_log_entry_t> &log_entries,
+    boost::optional<pg_hit_set_history_t> &hset_history,
     Context *on_local_applied_sync,
     Context *on_all_applied,
     Context *on_all_commit,
@@ -358,9 +360,11 @@ private:
     ceph_tid_t tid,
     osd_reqid_t reqid,
     eversion_t pg_trim_to,
+    eversion_t pg_trim_rollback_to,
     hobject_t new_temp_oid,
     hobject_t discard_temp_oid,
     vector<pg_log_entry_t> &log_entries,
+    boost::optional<pg_hit_set_history_t> &hset_history,
     InProgressOp *op,
     ObjectStore::Transaction *op_t);
   void op_applied(InProgressOp *op);

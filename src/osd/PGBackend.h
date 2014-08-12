@@ -22,7 +22,6 @@
 #include "PGLog.h"
 #include "osd_types.h"
 #include "common/WorkQueue.h"
-#include "osd_types.h"
 #include "include/Context.h"
 #include "os/ObjectStore.h"
 #include "common/LogClient.h"
@@ -175,7 +174,9 @@
 
      virtual void log_operation(
        vector<pg_log_entry_t> &logv,
+       boost::optional<pg_hit_set_history_t> &hset_history,
        const eversion_t &trim_to,
+       const eversion_t &trim_rollback_to,
        bool transaction_applied,
        ObjectStore::Transaction *t) = 0;
 
@@ -189,7 +190,7 @@
      virtual void update_stats(
        const pg_stat_t &stat) = 0;
 
-     virtual void schedule_work(
+     virtual void schedule_recovery_work(
        GenContext<ThreadPool::TPHandle&> *c) = 0;
 
      virtual pg_shard_t whoami_shard() const = 0;
@@ -299,12 +300,16 @@
 
    virtual void check_recovery_sources(const OSDMapRef osdmap) = 0;
 
+
+   /**
+    * clean up any temporary on-disk state due to a pg interval change
+    */
+   void on_change_cleanup(ObjectStore::Transaction *t);
    /**
     * implementation should clear itself, contexts blessed prior to on_change
     * won't be called after on_change()
     */
-   void on_change(ObjectStore::Transaction *t);
-   virtual void _on_change(ObjectStore::Transaction *t) = 0;
+   virtual void on_change() = 0;
    virtual void clear_state() = 0;
 
    virtual void on_flushed() = 0;
@@ -491,7 +496,10 @@
      const eversion_t &at_version,        ///< [in] version
      PGTransaction *t,                    ///< [in] trans to execute
      const eversion_t &trim_to,           ///< [in] trim log to here
+     const eversion_t &trim_rollback_to,  ///< [in] trim rollback info to here
      vector<pg_log_entry_t> &log_entries, ///< [in] log entries for t
+     /// [in] hitset history (if updated with this transaction)
+     boost::optional<pg_hit_set_history_t> &hset_history,
      Context *on_local_applied_sync,      ///< [in] called when applied locally
      Context *on_all_applied,             ///< [in] called when all acked
      Context *on_all_commit,              ///< [in] called when all commit
@@ -548,7 +556,8 @@
      const hobject_t &start,
      const hobject_t &end,
      snapid_t seq,
-     vector<hobject_t> *ls);
+     vector<hobject_t> *ls,
+     vector<ghobject_t> *gen_obs=0);
 
    int objects_get_attr(
      const hobject_t &hoid,
@@ -589,7 +598,7 @@
      map<hobject_t, pg_shard_t> &authoritative,
      map<hobject_t, set<pg_shard_t> > &invalid_snapcolls,
      int &shallow_errors, int &deep_errors,
-     const spg_t pgid,
+     const spg_t& pgid,
      const vector<int> &acting,
      ostream &errorstream);
    virtual uint64_t be_get_ondisk_size(
@@ -622,14 +631,14 @@ struct PG_SendMessageOnConn: public Context {
   }
 };
 
-struct PG_QueueAsync : public Context {
+struct PG_RecoveryQueueAsync : public Context {
   PGBackend::Listener *pg;
   GenContext<ThreadPool::TPHandle&> *c;
-  PG_QueueAsync(
+  PG_RecoveryQueueAsync(
     PGBackend::Listener *pg,
     GenContext<ThreadPool::TPHandle&> *c) : pg(pg), c(c) {}
   void finish(int) {
-    pg->schedule_work(c);
+    pg->schedule_recovery_work(c);
   }
 };
 

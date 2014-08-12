@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 
 #include "rgw_common.h"
 #include "rgw_rados.h"
@@ -46,6 +48,7 @@ void RGWObjManifestRule::dump(Formatter *f) const
   encode_json("start_ofs", start_ofs, f);
   encode_json("part_size", part_size, f);
   encode_json("stripe_max_size", stripe_max_size, f);
+  encode_json("override_prefix", override_prefix, f);
 }
 
 void RGWObjManifest::dump(Formatter *f) const

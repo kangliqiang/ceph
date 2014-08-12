@@ -167,8 +167,8 @@ public:
 private:
   void reset_to_type(impl_type_t type);
 };
-WRITE_CLASS_ENCODER(HitSet);
-WRITE_CLASS_ENCODER(HitSet::Params);
+WRITE_CLASS_ENCODER(HitSet)
+WRITE_CLASS_ENCODER(HitSet::Params)
 
 typedef boost::shared_ptr<HitSet> HitSetRef;
 
@@ -369,7 +369,7 @@ public:
       return (double)fpp_micro / 1000000.0;
     }
     void set_fpp(double f) {
-      fpp_micro = (unsigned)(f * 1000000.0);
+      fpp_micro = (unsigned)(llrintl(f * (double)1000000.0));
     }
 
     void encode(bufferlist& bl) const {

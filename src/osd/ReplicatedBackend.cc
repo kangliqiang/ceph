@@ -192,8 +192,9 @@ void ReplicatedBackend::clear_state()
   pull_from_peer.clear();
 }
 
-void ReplicatedBackend::_on_change(ObjectStore::Transaction *t)
+void ReplicatedBackend::on_change()
 {
+  dout(10) << __func__ << dendl;
   for (map<ceph_tid_t, InProgressOp>::iterator i = in_progress_ops.begin();
        i != in_progress_ops.end();
        in_progress_ops.erase(i++)) {
@@ -254,14 +255,14 @@ void ReplicatedBackend::objects_read_async(
     int _r = store->read(coll, hoid, i->first.first,
 			 i->first.second, *(i->second.first));
     if (i->second.second) {
-      get_parent()->schedule_work(
+      get_parent()->schedule_recovery_work(
 	get_parent()->bless_gencontext(
 	  new AsyncReadCallback(_r, i->second.second)));
     }
     if (_r < 0)
       r = _r;
   }
-  get_parent()->schedule_work(
+  get_parent()->schedule_recovery_work(
     get_parent()->bless_gencontext(
       new AsyncReadCallback(r, on_complete)));
 }
@@ -329,7 +330,7 @@ public:
     version_t former_version) {
     t->collection_move_rename(
       coll, hoid, coll,
-      ghobject_t(hoid, former_version, ghobject_t::NO_SHARD));
+      ghobject_t(hoid, former_version, shard_id_t::NO_SHARD));
   }
   void setattrs(
     const hobject_t &hoid,
@@ -493,7 +494,9 @@ void ReplicatedBackend::submit_transaction(
   const eversion_t &at_version,
   PGTransaction *_t,
   const eversion_t &trim_to,
+  const eversion_t &trim_rollback_to,
   vector<pg_log_entry_t> &log_entries,
+  boost::optional<pg_hit_set_history_t> &hset_history,
   Context *on_local_applied_sync,
   Context *on_all_acked,
   Context *on_all_commit,
@@ -532,10 +535,12 @@ void ReplicatedBackend::submit_transaction(
     tid,
     reqid,
     trim_to,
+    trim_rollback_to,
     t->get_temp_added().size() ? *(t->get_temp_added().begin()) : hobject_t(),
     t->get_temp_cleared().size() ?
       *(t->get_temp_cleared().begin()) :hobject_t(),
     log_entries,
+    hset_history,
     &op,
     op_t);
 
@@ -546,7 +551,13 @@ void ReplicatedBackend::submit_transaction(
   }
   clear_temp_objs(t->get_temp_cleared());
 
-  parent->log_operation(log_entries, trim_to, true, &local_t);
+  parent->log_operation(
+    log_entries,
+    hset_history,
+    trim_to,
+    trim_rollback_to,
+    true,
+    &local_t);
   local_t.append(*op_t);
   local_t.swap(*op_t);
   

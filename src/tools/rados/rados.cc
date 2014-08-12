@@ -110,7 +110,7 @@ void usage(ostream& out)
 "IMPORT AND EXPORT\n"
 "   import [options] <local-directory> <rados-pool>\n"
 "       Upload <local-directory> to <rados-pool>\n"
-"   export [options] rados-pool> <local-directory>\n"
+"   export [options] <rados-pool> <local-directory>\n"
 "       Download <rados-pool> to <local-directory>\n"
 "   options:\n"
 "       -f / --force                 Copy everything, even if it hasn't changed.\n"
@@ -195,7 +195,7 @@ static int dump_data(std::string const &filename, bufferlist const &data)
 {
   int fd;
   if (filename == "-") {
-    fd = 1;
+    fd = STDOUT_FILENO;
   } else {
     fd = TEMP_FAILURE_RETRY(::open(filename.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644));
     if (fd < 0) {
@@ -221,7 +221,7 @@ static int do_get(IoCtx& io_ctx, const char *objname, const char *outfile, unsig
 
   int fd;
   if (strcmp(outfile, "-") == 0) {
-    fd = 1;
+    fd = STDOUT_FILENO;
   } else {
     fd = TEMP_FAILURE_RETRY(::open(outfile, O_WRONLY|O_CREAT|O_TRUNC, 0644));
     if (fd < 0) {
@@ -411,7 +411,7 @@ static int do_put(IoCtx& io_ctx, const char *objname, const char *infile, int op
     stdio = true;
 
   int ret;
-  int fd = 0;
+  int fd = STDIN_FILENO;
   if (!stdio)
     fd = open(infile, O_RDONLY);
   if (fd < 0) {
@@ -1125,12 +1125,12 @@ static int do_cache_evict(IoCtx& io_ctx, string oid)
 
 static int do_cache_flush_evict_all(IoCtx& io_ctx, bool blocking)
 {
-  int r;
   int errors = 0;
   try {
     librados::ObjectIterator i = io_ctx.objects_begin();
     librados::ObjectIterator i_end = io_ctx.objects_end();
     for (; i != i_end; ++i) {
+      int r;
       cout << i->first << "\t" << i->second << std::endl;
       if (i->second.size()) {
 	io_ctx.locator_set_key(i->second);
@@ -1358,6 +1358,15 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       cerr << "error opening pool " << pool_name << ": "
 	   << cpp_strerror(ret) << std::endl;
       goto out;
+    }
+
+    // align op_size
+    if (io_ctx.pool_requires_alignment()) {
+      const uint64_t align = io_ctx.pool_required_alignment();
+      const bool wrn = (op_size != (1<<22));
+      op_size = uint64_t((op_size + align - 1) / align) * align;
+      if (wrn)
+	cerr << "INFO: op_size has been rounded to " << op_size << std::endl;
     }
   }
 
@@ -1632,15 +1641,22 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     }
   }
   else if (strcmp(nargs[0], "setxattr") == 0) {
-    if (!pool_name || nargs.size() < 4)
+    if (!pool_name || nargs.size() < 3 || nargs.size() > 4)
       usage_exit();
 
     string oid(nargs[1]);
     string attr_name(nargs[2]);
-    string attr_val(nargs[3]);
-
     bufferlist bl;
-    bl.append(attr_val.c_str(), attr_val.length());
+    if (nargs.size() == 4) {
+      string attr_val(nargs[3]);
+      bl.append(attr_val.c_str(), attr_val.length());
+    } else {
+      do {
+	ret = bl.read_fd(STDIN_FILENO, 1024); // from stdin
+	if (ret < 0)
+	  goto out;
+      } while (ret > 0);
+    }
 
     ret = io_ctx.setxattr(oid, attr_name.c_str(), bl);
     if (ret < 0) {
@@ -1666,7 +1682,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     else
       ret = 0;
     string s(bl.c_str(), bl.length());
-    cout << s << std::endl;
+    cout << s;
   } else if (strcmp(nargs[0], "rmxattr") == 0) {
     if (!pool_name || nargs.size() < 3)
       usage_exit();

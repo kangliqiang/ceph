@@ -145,7 +145,7 @@ string GenericObjectMap::header_key(const coll_t &cid, const ghobject_t &oid)
   full_name += string(buf);
 
   if (oid.generation != ghobject_t::NO_GEN) {
-    assert(oid.shard_id != ghobject_t::NO_SHARD);
+    assert(oid.shard_id != shard_id_t::NO_SHARD);
     full_name.append(GHOBJECT_KEY_SEP_S);
 
     t = buf;
@@ -175,7 +175,7 @@ bool GenericObjectMap::parse_header_key(const string &long_name,
   snapid_t snap;
   uint64_t pool;
   gen_t generation = ghobject_t::NO_GEN;
-  shard_t shard_id = ghobject_t::NO_SHARD;
+  shard_id_t shard_id = shard_id_t::NO_SHARD;
 
   string::const_iterator current = long_name.begin();
   string::const_iterator end;
@@ -249,7 +249,7 @@ bool GenericObjectMap::parse_header_key(const string &long_name,
       return false;
     shardstring = string(current, end);
 
-    shard_id = (shard_t)strtoul(shardstring.c_str(), NULL, 16);
+    shard_id = (shard_id_t)strtoul(shardstring.c_str(), NULL, 16);
   }
 
   if (out) {
@@ -689,8 +689,6 @@ void GenericObjectMap::rename(const Header old_header, const coll_t &cid,
   old_header->cid = cid;
   old_header->oid = target;
   set_header(cid, target, *old_header, t);
-
-  // "in_use" still hold the "seq"
 }
 
 int GenericObjectMap::init(bool do_upgrade)
@@ -926,35 +924,18 @@ GenericObjectMap::Header GenericObjectMap::_lookup_header(
   to_get.insert(header_key(cid, oid));
   _Header header;
 
-  while (1) {
-    map<string, bufferlist> out;
-    bool try_again = false;
+  map<string, bufferlist> out;
 
-    int r = db->get(GHOBJECT_TO_SEQ_PREFIX, to_get, &out);
-    if (r < 0)
-      return Header();
-    if (out.empty())
-      return Header();
+  int r = db->get(GHOBJECT_TO_SEQ_PREFIX, to_get, &out);
+  if (r < 0)
+    return Header();
+  if (out.empty())
+    return Header();
 
-    bufferlist::iterator iter = out.begin()->second.begin();
-    header.decode(iter);
+  bufferlist::iterator iter = out.begin()->second.begin();
+  header.decode(iter);
 
-    while (in_use.count(header.seq)) {
-      header_cond.Wait(header_lock);
-
-      // Another thread is hold this header, wait for it.
-      // Because the seq of this object may change, such as clone
-      // and rename operation, here need to look up "seq" again
-      try_again = true;
-    }
-
-    if (!try_again) {
-      break;
-    }
-  }
-
-  Header ret = Header(new _Header(header), RemoveOnDelete(this));
-  in_use.insert(ret->seq);
+  Header ret = Header(new _Header(header));
   return ret;
 }
 
@@ -962,7 +943,7 @@ GenericObjectMap::Header GenericObjectMap::_generate_new_header(
     const coll_t &cid, const ghobject_t &oid, Header parent,
     KeyValueDB::Transaction t)
 {
-  Header header = Header(new _Header(), RemoveOnDelete(this));
+  Header header = Header(new _Header());
   header->seq = state.seq++;
   if (parent) {
     header->parent = parent->seq;
@@ -970,8 +951,6 @@ GenericObjectMap::Header GenericObjectMap::_generate_new_header(
   header->num_children = 1;
   header->oid = oid;
   header->cid = cid;
-  assert(!in_use.count(header->seq));
-  in_use.insert(header->seq);
 
   write_state(t);
   return header;
@@ -980,8 +959,6 @@ GenericObjectMap::Header GenericObjectMap::_generate_new_header(
 GenericObjectMap::Header GenericObjectMap::lookup_parent(Header input)
 {
   Mutex::Locker l(header_lock);
-  while (in_use.count(input->parent))
-    header_cond.Wait(header_lock);
   map<string, bufferlist> out;
   set<string> keys;
   keys.insert(PARENT_KEY);
@@ -999,13 +976,12 @@ GenericObjectMap::Header GenericObjectMap::lookup_parent(Header input)
     return Header();
   }
 
-  Header header = Header(new _Header(), RemoveOnDelete(this));
+  Header header = Header(new _Header());
   header->seq = input->parent;
   bufferlist::iterator iter = out.begin()->second.begin();
   header->decode(iter);
   dout(20) << "lookup_parent: parent seq is " << header->seq << " with parent "
            << header->parent << dendl;
-  in_use.insert(header->seq);
   return header;
 }
 

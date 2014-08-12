@@ -32,7 +32,8 @@ librgw_la_SOURCES =  \
 	rgw/rgw_metadata.cc \
 	rgw/rgw_replica_log.cc \
 	rgw/rgw_keystone.cc \
-	rgw/rgw_quota.cc
+	rgw/rgw_quota.cc \
+	rgw/rgw_dencoder.cc
 librgw_la_CXXFLAGS = -Woverloaded-virtual ${AM_CXXFLAGS}
 noinst_LTLIBRARIES += librgw.la
 
@@ -73,7 +74,7 @@ radosgw_SOURCES = \
 	rgw/rgw_civetweb.cc \
 	civetweb/src/civetweb.c \
 	rgw/rgw_main.cc
-radosgw_CFLAGS = -Icivetweb/include
+radosgw_CFLAGS = -I$(srcdir)/civetweb/include
 radosgw_LDADD = $(LIBRGW) $(LIBRGW_DEPS) $(RESOLV_LIBS) $(CEPH_GLOBAL)
 bin_PROGRAMS += radosgw
 
@@ -160,4 +161,3 @@ noinst_HEADERS += \
 	civetweb/civetweb.h \
 	civetweb/include/civetweb.h \
 	civetweb/src/md5.h
-

@@ -26,6 +26,7 @@
 #include "CDir.h"
 #include "include/Context.h"
 #include "events/EMetaBlob.h"
+#include "RecoveryQueue.h"
 
 #include "messages/MClientRequest.h"
 #include "messages/MMDSSlaveRequest.h"
@@ -137,7 +138,6 @@ public:
     frag_t frag;
     snapid_t snap;
     filepath want_path;
-    inodeno_t want_ino;
     bool want_base_dir;
     bool want_xlocked;
 
@@ -166,9 +166,6 @@ public:
 		     bool want_xlocked=false, int from=-1);
   void discover_path(CDir *base, snapid_t snap, filepath want_path, Context *onfinish,
 		     bool want_xlocked=false);
-  void discover_ino(CDir *base, inodeno_t want_ino, Context *onfinish,
-		    bool want_xlocked=false);
-
   void kick_discovers(int who);  // after a failure.
 
 
@@ -246,7 +243,7 @@ public:
   int get_num_client_requests();
 
   MDRequestRef request_start(MClientRequest *req);
-  MDRequestRef request_start_slave(metareqid_t rid, __u32 attempt, int by);
+  MDRequestRef request_start_slave(metareqid_t rid, __u32 attempt, Message *m);
   MDRequestRef request_start_internal(int op);
   bool have_request(metareqid_t rid) {
     return active_requests.count(rid);
@@ -329,7 +326,7 @@ protected:
     bool safe;
     bool committing;
     bool recovering;
-    umaster() : committing(false), recovering(false) {}
+    umaster() : ls(NULL), safe(false), committing(false), recovering(false) {}
   };
   map<metareqid_t, umaster>                 uncommitted_masters;         // master: req -> slave set
 
@@ -351,12 +348,12 @@ protected:
   void discard_delayed_resolve(int who);
   void maybe_resolve_finish();
   void disambiguate_imports();
-  void recalc_auth_bits();
   void trim_unlinked_inodes();
   void add_uncommitted_slave_update(metareqid_t reqid, int master, MDSlaveUpdate*);
   void finish_uncommitted_slave_update(metareqid_t reqid, int master);
   MDSlaveUpdate* get_uncommitted_slave_update(metareqid_t reqid, int master);
 public:
+  void recalc_auth_bits(bool replay);
   void remove_inode_recursive(CInode *in);
 
   bool is_ambiguous_slave_update(metareqid_t reqid, int master) {
@@ -443,9 +440,6 @@ protected:
 				      set<vinodeno_t>& acked_inodes,
 				      set<SimpleLock *>& gather_locks);
   void handle_cache_rejoin_ack(MMDSCacheRejoin *m);
-  void handle_cache_rejoin_purge(MMDSCacheRejoin *m);
-  void handle_cache_rejoin_missing(MMDSCacheRejoin *m);
-  void handle_cache_rejoin_full(MMDSCacheRejoin *m);
   void rejoin_send_acks();
   void rejoin_trim_undef_inodes();
   void maybe_send_pending_rejoins() {
@@ -533,25 +527,15 @@ public:
   friend class MDBalancer;
 
 
-  // file size recovery
-  set<CInode*> file_recover_queue;
-  set<CInode*> file_recovering;
-
-  void queue_file_recover(CInode *in);
-  void unqueue_file_recover(CInode *in);
-  void _queued_file_recover_cow(CInode *in, MutationRef& mut);
-  void _queue_file_recover(CInode *in);
+  // File size recovery
+private:
+  RecoveryQueue recovery_queue;
   void identify_files_to_recover(vector<CInode*>& recover_q, vector<CInode*>& check_q);
   void start_files_to_recover(vector<CInode*>& recover_q, vector<CInode*>& check_q);
-
+public:
   void do_file_recover();
-  void _recovered(CInode *in, int r, uint64_t size, utime_t mtime);
-
-  void purge_prealloc_ino(inodeno_t ino, Context *fin);
-
-
-
- public:
+  void queue_file_recover(CInode *in);
+  void _queued_file_recover_cow(CInode *in, MutationRef& mut);
 
   // subsystems
   Migrator *migrator;
@@ -572,7 +556,7 @@ public:
   size_t get_cache_size() { return lru.lru_get_size(); }
 
   // trimming
-  bool trim(int max = -1);   // trim cache
+  bool trim(int max=-1, int count=-1);   // trim cache
   bool trim_dentry(CDentry *dn, map<int, MCacheExpire*>& expiremap);
   void trim_dirfrag(CDir *dir, CDir *con,
 		    map<int, MCacheExpire*>& expiremap);
@@ -629,11 +613,11 @@ public:
     frag_t fg = in->pick_dirfrag(dn);
     return in->get_dirfrag(fg);
   }
-  CDir* get_force_dirfrag(dirfrag_t df) {
+  CDir* get_force_dirfrag(dirfrag_t df, bool replay) {
     CInode *diri = get_inode(df.ino);
     if (!diri)
       return NULL;
-    CDir *dir = force_dir_fragment(diri, df.frag);
+    CDir *dir = force_dir_fragment(diri, df.frag, replay);
     if (!dir)
       dir = diri->get_dirfrag(df.frag);
     return dir;
@@ -666,7 +650,8 @@ public:
   }
   void touch_dentry_bottom(CDentry *dn) {
     lru.lru_bottouch(dn);
-    if (dn->get_projected_linkage()->is_primary()) {
+    if (dn->get_projected_linkage()->is_primary() &&
+	dn->get_dir()->inode->is_stray()) {
       CInode *in = dn->get_projected_linkage()->get_inode();
       if (in->has_dirfrags()) {
 	list<CDir*> ls;
@@ -780,11 +765,6 @@ public:
 
   void open_remote_dirfrag(CInode *diri, frag_t fg, Context *fin);
   CInode *get_dentry_inode(CDentry *dn, MDRequestRef& mdr, bool projected=false);
-  void open_remote_ino(inodeno_t ino, Context *fin, bool want_xlocked=false,
-		       inodeno_t hadino=0, version_t hadv=0);
-  void open_remote_ino_2(inodeno_t ino,
-			 vector<Anchor>& anchortrace, bool want_xlocked,
-			 inodeno_t hadino, version_t hadv, Context *onfinish);
 
   bool parallel_fetch(map<inodeno_t,filepath>& pathmap, set<inodeno_t>& missing);
   bool parallel_fetch_traverse_dir(inodeno_t ino, filepath& path, 
@@ -794,7 +774,7 @@ public:
   void open_remote_dentry(CDentry *dn, bool projected, Context *fin,
 			  bool want_xlocked=false);
   void _open_remote_dentry_finish(CDentry *dn, inodeno_t ino, Context *fin,
-				  bool want_xlocked, int mode, int r);
+				  bool want_xlocked, int r);
 
   void make_trace(vector<CDentry*>& trace, CInode *in);
 
@@ -860,18 +840,6 @@ public:
   void handle_find_ino(MMDSFindIno *m);
   void handle_find_ino_reply(MMDSFindInoReply *m);
   void kick_find_ino_peers(int who);
-
-  // -- anchors --
-public:
-  void anchor_create_prep_locks(MDRequestRef& mdr, CInode *in, set<SimpleLock*>& rdlocks,
-				set<SimpleLock*>& xlocks);
-  void anchor_create(MDRequestRef& mdr, CInode *in, Context *onfinish);
-  void anchor_destroy(CInode *in, Context *onfinish);
-protected:
-  void _anchor_prepared(CInode *in, version_t atid, bool add);
-  void _anchor_logged(CInode *in, version_t atid, MutationRef& mut);
-  friend class C_MDC_AnchorPrepared;
-  friend class C_MDC_AnchorLogged;
 
   // -- snaprealms --
 public:
@@ -947,7 +915,7 @@ public:
 
   // -- namespace --
 public:
-  void send_dentry_link(CDentry *dn);
+  void send_dentry_link(CDentry *dn, MDRequestRef& mdr);
   void send_dentry_unlink(CDentry *dn, CDentry *straydn, MDRequestRef& mdr);
 protected:
   void handle_dentry_link(MDentryLink *m);
@@ -973,11 +941,12 @@ private:
     list<CDir*> resultfrags;
     MDRequestRef mdr;
     // for deadlock detection
-    bool has_frozen;
+    bool all_frozen;
     utime_t last_cum_auth_pins_change;
     int last_cum_auth_pins;
     int num_remote_waiters;	// number of remote authpin waiters
-    fragment_info_t() : has_frozen(false), last_cum_auth_pins(0), num_remote_waiters(0) {}
+    fragment_info_t() : all_frozen(false), last_cum_auth_pins(0), num_remote_waiters(0) {}
+    bool is_fragmenting() { return !resultfrags.empty(); }
   };
   map<dirfrag_t,fragment_info_t> fragments;
 
@@ -993,9 +962,9 @@ private:
   void get_force_dirfrag_bound_set(vector<dirfrag_t>& dfs, set<CDir*>& bounds);
 
   bool can_fragment(CInode *diri, list<CDir*>& dirs);
-  void fragment_freeze_dirs(list<CDir*>& dirs, C_GatherBuilder &gather);
-  void fragment_mark_and_complete(list<CDir*>& dirs);
-  void fragment_frozen(dirfrag_t basedirfrag, int r);
+  void fragment_freeze_dirs(list<CDir*>& dirs);
+  void fragment_mark_and_complete(MDRequestRef& mdr);
+  void fragment_frozen(MDRequestRef& mdr, int r);
   void fragment_unmark_unfreeze_dirs(list<CDir*>& dirs);
   void dispatch_fragment_dir(MDRequestRef& mdr);
   void _fragment_logged(MDRequestRef& mdr);
